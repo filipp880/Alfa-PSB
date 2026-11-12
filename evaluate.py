@@ -10,7 +10,8 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict
+from copy import copy
+from dataclasses import asdict, replace
 import json
 import math
 import os
@@ -31,6 +32,9 @@ HYPHENS = str.maketrans("ё‐‒–—−", "е-----")
 ENDPOINTS = ("/chat/completions", "/embeddings", "/rerank")
 NO_ANSWER_STATUSES = {"refusal", "insufficient", "clarification", "out_of_scope"}
 PASSAGE_MARKER = re.compile(r"\[(P\d+)\]")
+CITATION_RUN = re.compile(r"\[P\d+\](?:[\s,]*\[P\d+\])*")
+CLAUSE_BREAK = re.compile(r"[;\n]|[!?](?=\s)|(?<!\b\w)(?<!\bул)(?<!\bстр)(?<!\bруб)\.(?=\s)")
+MUTATION_FIELDS = ("member", "old", "new")
 
 
 def normalized(text: str) -> str:
@@ -50,12 +54,22 @@ def read_cases(path: Path, ids: list[str]) -> list[dict]:
     for case in cases:
         assertions = case.get("assertions", [])
         patterns = case["must"] + case.get("must_not", [])
-        patterns.extend(pattern for item in assertions for pattern in item["must"])
+        for item in assertions:
+            patterns.extend(item["must"])
+            if "subject" in item:
+                patterns.append(item["subject"])
         for pattern in patterns:
             re.compile(pattern)
         indices = [*case.get("cite", []), *(index for item in assertions for index in item["cite"])]
         if any(not 0 <= index < len(case["evidence"]) for index in indices):
             raise ValueError(f"Неверный индекс эталонной ссылки в {case['id']}.")
+        if "kb_mutation" in case:
+            mutation = case["kb_mutation"]
+            if (not isinstance(mutation, dict) or set(mutation) != set(MUTATION_FIELDS)
+                    or not all(isinstance(mutation[field], str) for field in MUTATION_FIELDS)
+                    or not mutation["old"] or mutation["old"] == mutation["new"]
+                    or PurePosixPath(mutation["member"]).suffix.lower() not in {".txt", ".md"}):
+                raise ValueError(f"Некорректное изменение базы в {case['id']}.")
     return [case for case in cases if not ids or case["id"] in ids]
 
 
@@ -81,6 +95,33 @@ def hits(ids: set[str], slots: list[set[str]]) -> list[bool]:
     return [bool(ids & matches) for matches in slots]
 
 
+def cited_blocks(text: str, valid_ids: set[str]):
+    """Attach each run of rendered citations to the claim it follows."""
+    for paragraph in re.split(r"\n\s*\n", text):
+        start = 0
+        for markers in CITATION_RUN.finditer(paragraph):
+            if block := paragraph[start:markers.start()].strip():
+                yield block, valid_ids.intersection(PASSAGE_MARKER.findall(markers[0]))
+            start = markers.end()
+        if block := paragraph[start:].strip():
+            yield block, set()
+
+
+def subject_clauses(block: str, subjects: list[str]):
+    """Keep values on their own side when a claim names several distinct subjects."""
+    for raw_clause in CLAUSE_BREAK.split(block):
+        clause = normalized(raw_clause)
+        mentions = sorted((match.start(), match.end(), subject) for subject in subjects
+                          for match in re.finditer(subject, clause))
+        start = 0
+        for previous, current in zip(mentions, mentions[1:]):
+            if previous[2] != current[2] and previous[1] <= current[0]:
+                yield clause[start:current[0]], previous[2]
+                start = current[0]
+        if mentions:
+            yield clause[start:], mentions[-1][2]
+
+
 def grade_answer(answer, case: dict, slots: list[set[str]], corpus) -> dict:
     status = answer.status if answer is not None else "error"
     answer_text = answer.text if answer is not None else ""
@@ -91,6 +132,8 @@ def grade_answer(answer, case: dict, slots: list[set[str]], corpus) -> dict:
         citation for citation in citations
         if (passage := corpus.passages.get(citation.id)) is not None
         and citation.document_id == passage.document_id
+        and citation.locator == passage.locator
+        and citation.title == corpus.documents[passage.document_id].title
         and citation.quote and citation.quote in passage.text
     ]
     valid_ids = {citation.id for citation in valid_citations}
@@ -98,12 +141,18 @@ def grade_answer(answer, case: dict, slots: list[set[str]], corpus) -> dict:
     missing_citations = [index for index in required_cites if not (valid_ids & slots[index])]
     missing_assertions = []
     if assertions := case.get("assertions"):
-        blocks = [(normalized(PASSAGE_MARKER.sub("", block)), valid_ids.intersection(PASSAGE_MARKER.findall(block)))
-                  for block in answer_text.split("\n\n")]
+        blocks = list(cited_blocks(answer_text, valid_ids))
+        subjects = list(dict.fromkeys(item["subject"] for item in assertions if "subject" in item))
         for index, item in enumerate(assertions):
             candidates = [block for block, ids in blocks if all(ids & slots[slot] for slot in item["cite"])]
-            if item.get("same_clause"):
-                candidates = [clause for block in candidates for clause in re.split(r";|,(?!\d)", block)]
+            if subject := item.get("subject"):
+                candidates = [clause for block in candidates for clause, owner in subject_clauses(block, subjects)
+                              if owner == subject]
+            elif item.get("same_clause"):
+                candidates = [normalized(clause) for block in candidates
+                              for clause in re.split(r";|,(?!\d)", block)]
+            else:
+                candidates = list(map(normalized, candidates))
             if not any(all(re.search(pattern, block) for pattern in item["must"]) for block in candidates):
                 missing_assertions.append(index)
     return {
@@ -172,7 +221,19 @@ def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[in
     chat = live.gateway.chat
 
     def capture_chat(system, user, deadline, *, verify=False):
-        result = chat(system, user, deadline, verify=verify)
+        stage = {"stage": "verify" if verify else "draft"}
+        if not verify:
+            stage["anchors"] = user.get("anchors", {})
+            stage["passages"] = [
+                {"id": p.get("id"), "applicability": p.get("applicability"), "text_visible": bool(p.get("text"))}
+                for p in user.get("passages", [])
+            ]
+        stages.append(stage)
+        try:
+            result = chat(system, user, deadline, verify=verify)
+        except Exception as exc:
+            stage["exception_type"] = type(exc).__name__
+            raise
         keys = ("supported", "gap_ok") if verify else ("status", "claims", "gap", "look_for")
         output = {key: result[key] for key in keys if key in result}
         if isinstance(output.get("claims"), list):
@@ -180,13 +241,15 @@ def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[in
                 {key: claim[key] for key in ("text", "evidence") if key in claim}
                 for claim in output["claims"] if isinstance(claim, dict)
             ]
-        stages.append({"stage": "verify" if verify else "draft", "output": output})
+        stage["output"] = output
         return result
 
     before = request_counts(live)
     error_type = None
     started = time.perf_counter()
     with ExitStack() as stack:
+        if reference_context:
+            stack.enter_context(patch.object(live, "settings", replace(live.settings, retry_search=False)))
         stack.enter_context(patch.object(live, "retrieve", capture_retrieval))
         stack.enter_context(patch.object(live, "context", capture_context))
         if callable(answer_once):
@@ -220,62 +283,105 @@ def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[in
             "answer": answer.text if answer is not None else "",
             "csv_answer": answer.csv_text() if answer is not None else "",
             "citations": [asdict(citation) for citation in answer.citations] if answer is not None else [],
+            "ranked_ids": [[p.id for p in ranking] for ranking in rankings],
             "context_ids": [[p.id for p in selection] for selection in contexts],
             "stages": stages,
         }} if audit else {}),
     }
 
 
+@contextmanager
+def mutated_kb(path: Path, mutation: dict):
+    """Copy the official archive and replace a single exact UTF-8 source span."""
+    member = mutation["member"]
+    old, new = mutation["old"].encode("utf-8"), mutation["new"].encode("utf-8")
+    with tempfile.TemporaryDirectory(prefix="psb-eval-kb-") as temp, ZipFile(path) as original:
+        if original.namelist().count(member) != 1:
+            raise ValueError(f"Не найден единственный файл изменения базы: {member!r}")
+        source = original.read(member)
+        if source.count(old) != 1:
+            raise ValueError(f"Заменяемый текст должен встречаться ровно один раз в {member!r}")
+        target = Path(temp) / path.name
+        with ZipFile(target, "w") as changed:
+            for entry in original.infolist():
+                content = source.replace(old, new, 1) if entry.filename == member else original.read(entry)
+                changed.writestr(copy(entry), content)
+        yield target
+
+
+def evaluate_case(local, live, case: dict, question: str, history: list[dict], args: argparse.Namespace) -> dict:
+    try:
+        slots = gold_passages(local.corpus, case["evidence"])
+    except ValueError as exc:
+        raise ValueError(f"{case['id']}: {exc}") from exc
+    started = time.perf_counter()
+    kwargs = {}
+    if hasattr(local, "scope_for"):
+        kwargs["scope"] = local.scope_for(question, history)
+    ranked = local.retrieve(question, history, time.monotonic() + args.timeout, **kwargs)
+    context = local.context(ranked, **kwargs)
+    result = {
+        "id": case["id"],
+        "group": case["group"],
+        "ranked": {k: hits({p.id for p in ranked[:k]}, slots) for k in args.k},
+        "context": hits({p.id for p in context}, slots),
+        "index": [bool(slot) for slot in slots],
+        "context_size": len(context),
+        "context_chars": sum(len(local.corpus.context_text(p)) for p in context),
+        "search_ms": round((time.perf_counter() - started) * 1000, 2),
+        "kb_mutated": "kb_mutation" in case,
+    }
+    if live is not None:
+        result["live"] = evaluate_live_case(live, case, slots, args.k, args.timeout, audit=args.audit,
+                                            reference_context=args.reference_context)
+    return result
+
+
+def total_requests(counts: list[Counter | None]) -> dict | None:
+    if not counts or any(count is None for count in counts):
+        return None
+    total = Counter()
+    for count in counts:
+        total.update(count)
+    return dict(total)
+
+
 def evaluate(args: argparse.Namespace, cases: list[dict]) -> dict:
     sys.path.insert(0, str(args.implementation))
     from assistant import dialogue, load_assistant
 
-    local = load_assistant(args.kb, offline=True)
-    live = None
-    preparation = None
-    if args.live and local.settings.ready:
-        started = time.perf_counter()
-        live = load_assistant(args.kb, deadline=time.monotonic() + args.timeout)
-        preparation = {
-            "elapsed_seconds": round(time.perf_counter() - started, 4),
-            "requests": request_delta(Counter(), request_counts(live)),
-            "dense_active": bool(live.vectors),
-        }
-
+    assistants = {}
+    prepared_counts = []
+    preparation_time = 0.0
     results = []
-    for case in cases:
-        try:
-            slots = gold_passages(local.corpus, case["evidence"])
-        except ValueError as exc:
-            raise ValueError(f"{case['id']}: {exc}") from exc
-        question, history = dialogue(case["question"])
-        started = time.perf_counter()
-        kwargs = {}
-        if hasattr(local, "scope_for"):
-            kwargs["scope"] = local.scope_for(question, history)
-        ranked = local.retrieve(question, history, time.monotonic() + args.timeout, **kwargs)
-        context = local.context(ranked, **kwargs)
-        result = {
-            "id": case["id"],
-            "group": case["group"],
-            "ranked": {
-                k: hits({p.id for p in ranked[:k]}, slots)
-                for k in args.k
-            },
-            "context": hits({p.id for p in context}, slots),
-            "index": [bool(slot) for slot in slots],
-            "context_size": len(context),
-            "context_chars": sum(len(local.corpus.context_text(p)) for p in context),
-            "search_ms": round((time.perf_counter() - started) * 1000, 2),
-        }
-        if live is not None:
-            result["live"] = evaluate_live_case(live, case, slots, args.k, args.timeout, audit=args.audit,
-                                                reference_context=args.reference_context)
-        results.append(result)
+    with ExitStack() as stack:
+        for case in cases:
+            mutation = case.get("kb_mutation")
+            key = tuple(mutation[field] for field in MUTATION_FIELDS) if mutation else ()
+            if key not in assistants:
+                path = stack.enter_context(mutated_kb(args.kb, mutation)) if mutation else args.kb
+                local = load_assistant(path, offline=True)
+                live = None
+                if args.live and local.settings.ready:
+                    started = time.perf_counter()
+                    live = load_assistant(path, deadline=time.monotonic() + args.timeout)
+                    preparation_time += time.perf_counter() - started
+                    prepared_counts.append(request_counts(live))
+                assistants[key] = local, live
+            local, live = assistants[key]
+            question, history = dialogue(case["question"])
+            results.append(evaluate_case(local, live, case, question, history, args))
+    live_assistants = [live for _, live in assistants.values() if live is not None]
     return {
-        "live_ready": live is not None,
-        "live_preparation": preparation,
-        "live_requests": request_delta(Counter(), request_counts(live)) if live is not None else None,
+        "live_ready": bool(live_assistants),
+        "live_preparation": {
+            "elapsed_seconds": round(preparation_time, 4),
+            "requests": total_requests(prepared_counts),
+            "dense_active": all(live.vectors for live in live_assistants),
+            "dense_corpora": sum(bool(live.vectors) for live in live_assistants),
+            "corpora": len(live_assistants),
+        } if live_assistants else None,
+        "live_requests": total_requests([request_counts(live) for live in live_assistants]),
         "cases": results,
     }
 
@@ -411,7 +517,7 @@ def print_result(label: str, run: dict, cases: list[dict], args: argparse.Namesp
           f"{m['median_search_ms']:g} мс на поиск и сбор")
     if m["live_cases"]:
         if args.reference_context:
-            print("  Генерация получила только размеченные эталонные фрагменты.")
+            print("  Генерация получила только размеченные эталонные фрагменты. Повторный поиск отключён.")
         live_total = m["live_cases"]
         print(f"  API: статус {m['live_status_ok']}/{live_total}, шаблоны {m['live_facts_ok']}/{live_total}, "
               f"источники {m['live_citations_ok']}/{live_total}, всё вместе {m['live_pass']}/{live_total}")
@@ -429,6 +535,8 @@ def print_result(label: str, run: dict, cases: list[dict], args: argparse.Namesp
               f"подготовка и обработка {m['live_elapsed_seconds']:g} с")
         print(f"  Запросы всего {format_requests(run['live_requests'])}")
         index_status = "векторный индекс используется" if preparation["dense_active"] else "поиск без векторного индекса"
+        if preparation["corpora"] > 1:
+            index_status = f"векторный индекс в {preparation['dense_corpora']}/{preparation['corpora']} версиях базы"
         print(f"  Подготовка {preparation['elapsed_seconds']:g} с, {index_status}, "
               f"запросы {format_requests(preparation['requests'])}")
         print("  Проверка шаблонов и источников приближённая. Она не заменяет экспертную оценку ответа.")
@@ -439,7 +547,8 @@ def print_result(label: str, run: dict, cases: list[dict], args: argparse.Namesp
             missing = [item["file"] + " / " + item["quote"]
                        for item, hit in zip(case["evidence"], result["context"], strict=True) if not hit]
             status = "без эталонных фрагментов" if not case["evidence"] else f"пропущено фрагментов {len(missing)}"
-            print(f"    {result['id']}: {status}")
+            variant = " (временная копия базы)" if result["kb_mutated"] else ""
+            print(f"    {result['id']}{variant}: {status}")
             for text in missing:
                 print(f"      отсутствует {text}")
             if "live" in result:

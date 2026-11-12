@@ -110,6 +110,39 @@ class RetrievalTests(unittest.TestCase):
         document_only = corpus.scope("Что сказано в регламенте согласования договоров № 42 от 01.03.2025?")
         self.assertEqual(document_only.event_role, "document")
 
+    def test_compliance_uses_contract_signature_not_request_date(self):
+        corpus = self.corpus
+        letter = [p for p in corpus.passages.values()
+                  if corpus.documents[p.document_id].reference == "к-12"]
+        self.assertTrue(letter)
+        for query, day, expected in (
+            ("Запрос отправили 18 апреля 2025, подписать договор планируют 21 апреля.", 21, "applicable"),
+            ("Запрос отправили 18 апреля, договор подпишут 20 апреля 2025.", 20, "inapplicable"),
+            ("18 апреля 2025 направили запрос. 21 апреля подпишут договор.", 21, "applicable"),
+            ("Запрос отправили 18 апреля 2025. Дата подписания неизвестна.", 18, "unknown"),
+        ):
+            with self.subTest(query=query):
+                scope = corpus.scope(query + " Что требует письмо К-12?")
+                self.assertFalse(scope.comparison)
+                self.assertEqual(scope.date_ranges, ((date(2025, 4, day), date(2025, 4, day)),))
+                self.assertEqual({corpus.applicability(p, scope) for p in letter}, {expected})
+
+    def test_comparison_with_omitted_years_and_delivery_date(self):
+        corpus = self.corpus
+        for query in (
+            "Сравните адрес по П-17/2024 для спецификаций от 1 и 2 октября 2024.",
+            "Обе партии мебели по П-17/2024 приехали 14 октября 2024 года. "
+            "Спецификацию первой подписали 1 октября, второй — 2 октября. Куда везти каждую?",
+        ):
+            with self.subTest(query=query):
+                scope = corpus.scope(query)
+                self.assertTrue(scope.comparison)
+                self.assertEqual(scope.event_role, "specification")
+                self.assertEqual(scope.date_ranges, (
+                    (date(2024, 10, 1), date(2024, 10, 1)),
+                    (date(2024, 10, 2), date(2024, 10, 2)),
+                ))
+
     def test_explicit_cross_reference_and_consecutive_list(self):
         corpus = self.corpus
         sanctions = next(p for p in corpus.passages.values() if p.locator == "ст. 114, п. 4")

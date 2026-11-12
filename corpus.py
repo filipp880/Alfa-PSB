@@ -36,6 +36,7 @@ class Document:
     effective_to: date | None = None
     edition_note: str = ""
     reference: str = ""
+    effective_event: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +76,12 @@ _DATE = re.compile(
     re.IGNORECASE,
 )
 _ISO_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_DATE_WITHOUT_YEAR = re.compile(
+    rf"\b(?P<day>\d{{1,2}})\s+(?P<month>{_MONTH_PATTERN})\b"
+    r"|(?<![\d./-])(?P<number>\d{1,2})[./](?P<numeric_month>\d{1,2})(?![\d./-])",
+    re.I,
+)
+_SHARED_MONTH = re.compile(r"\b(\d{1,2})\s*(?:и\s+|,\s*|-\s*)$")
 _MONTH_YEAR = re.compile(rf"\b({_MONTH_PATTERN})\s+(\d{{4}})\b", re.IGNORECASE)
 _YEAR = re.compile(r"\b(?:в|за|на)\s+(20\d{2})\b|\b(20\d{2})\s*(?:год[ауе]?\b|г\.)", re.I)
 _WORD = re.compile(r"[а-яa-z]+|\d+(?:[.,]\d+)?")
@@ -103,6 +110,12 @@ _LOCATOR_POINT = re.compile(r"\b(?:п|ч)\.\s*(\d+(?:\.\d+)*(?:-\d+)?)\b", re.I)
 _LOCAL_POINT_LIST = re.compile(r"\bпункт\w*\s+([\d.,\s]+(?:и\s+\d+(?:\.\d+)*)?)\s+настоящей\s+статьи", re.I)
 _AMENDMENT_DATE = re.compile(r"\bспецификаци\w*[^.!?\n]{0,90}?подписан\w*\s+после\s+", re.I)
 _DATE_COMPARISON = re.compile(r"\b(?:сравн\w*|сопостав\w*|раньше\s+и\s+теперь|до\s+и\s+после)\b", re.I)
+_DATE_CLAUSE = re.compile(r"[!?;\n]|\.(?=\s)")
+_SIGNATURE = re.compile(r"\b(?:подпи[сш]\w*|заключ(?:ил\w*|а\w*|ен\w*|ить|ат)|заключени[яе]\s+договор\w*)\b")
+_SPECIFICATION = re.compile(r"\bспецификаци\w*\b")
+_REQUEST = re.compile(r"\b(?:запрос\w*|заявк\w*)\b")
+_DELIVERY = re.compile(r"\b(?:достав\w*|отгруз\w*|поставк\w*|поставл\w*|постави(?:ли|ть|т|м)|приеха\w*)\b")
+_FOLLOWING_ITEM = re.compile(r"^\s*[,;]?\s*(?:а\s+)?(?:втор\w*|трет\w*|друг\w*)\s*-\s*$")
 _RATE = re.compile(r"\b(\d+(?:[.,]\d+)?)\s*(?:%|процент\w*)", re.I)
 _AMOUNT = re.compile(r"\b(\d{1,3}(?:\s\d{3}){1,5})(?=\s*(?:\(|руб))|\b(\d{1,15})\s*(млн|тыс)\b", re.I)
 _LAW_FILE = re.compile(r"^(.+?)_ст(\d+(?:\.\d+)*)", re.I)
@@ -155,6 +168,9 @@ _ALIASES = (
     ("возврат", "возвращает", "возвращать"),
     ("гендиректор", "генеральный директор"),
     ("юротдел", "юридический отдел"),
+    ("оформить", "оформление", "оформляется"),
+    ("скан", "сканированная копия", "скан-копия"),
+    ("размещение", "размещаются", "разместить"),
     ("оплата", "оплачивает", "платить", "платеж"),
     ("переработка", "сверхурочная работа"),
     ("персональные данные", "персданные", "пдн"),
@@ -249,6 +265,36 @@ def _date_mentions(text: str) -> list[tuple[int, int, date]]:
     return sorted(values)
 
 
+def _query_date_mentions(text: str, default_year: int | None) -> list[tuple[int, int, date]]:
+    values = _date_mentions(text)
+    years = {value.year for _, _, value in values}
+    year = next(iter(years)) if len(years) == 1 else default_year if not years else None
+    if year is not None:
+        for match in _DATE_WITHOUT_YEAR.finditer(text):
+            start, end = match.span()
+            if any(start < other_end and end > other_start for other_start, other_end, _ in values):
+                continue
+            # Dotted numbers can also be clause locators. Require a temporal cue.
+            if match["number"] and re.search(r"\b(?:пункт\w*|стать\w*|п\.|ч\.|ст\.)\s*$", text[:start]):
+                continue
+            if match["number"] and not re.search(r"(?:\bна|\bот|\bдо|\bпосле|\bи|\b-\s*|\s-)\s*$", text[:start]):
+                continue
+            day = int(match["day"] or match["number"])
+            month = _month_number(match["month"]) if match["month"] else int(match["numeric_month"])
+            try:
+                values.append((start, end, date(year, month, day)))
+            except ValueError:
+                continue
+    for start, _, value in tuple(values):
+        if match := _SHARED_MONTH.search(text[:start]):
+            day = int(match[1])
+            if day > monthrange(value.year, value.month)[1] or not day:
+                continue
+            if not any(match.start() < end and match.end(1) > other_start for other_start, end, _ in values):
+                values.append((match.start(), match.end(1), value.replace(day=day)))
+    return sorted(values)
+
+
 def _first_date(text: str) -> date | None:
     mentions = _date_mentions(text)
     return mentions[0][2] if mentions else None
@@ -259,30 +305,29 @@ def _date_after(pattern: re.Pattern[str], text: str) -> date | None:
     return _first_date(text[match.end():]) if match else None
 
 
-def _event_role(text: str, start: int, end: int) -> str:
-    left = text[max(0, start - 75):start]
-    left = re.split(r"[!?;\n]|\.(?=\s)", left)[-1]
-    right = text[end:end + 35]
+def _event_role(left: str, right: str) -> str:
     if _DOCUMENT_DATE.search(left):
         return "document"
-    if re.search(r"\bспецификаци\w*\b", left) and re.search(
-        r"\b(?:подпис\w*|заключ\w*|от)\b", left
-    ):
-        return "specification"
-    if re.search(r"\b(?:подпис\w*|заключ\w*)\b", left):
-        if re.search(r"\bдоп(?:олнительное)?\s*соглашени\w*\b", left):
-            return "amendment_signature"
-        return "signature"
-    if re.search(r"\b(?:достав\w*|отгруз\w*|постав\w*)\b[^.!?]{0,28}$", left):
-        return "delivery"
-    if re.match(r"\s*(?:был[аио]?\s+)?подпис\w*\s+спецификаци\w*", right):
-        return "specification"
+    for clause in (left, right):
+        signature = _SIGNATURE.search(clause)
+        request = _REQUEST.search(clause)
+        delivery = _DELIVERY.search(clause)
+        if _SPECIFICATION.search(clause) and (signature or re.search(r"\bот\s*$", clause)):
+            return "specification"
+        if signature:
+            if re.search(r"\bдоп(?:олнительн\w*)?\s*соглашени\w*\b", clause):
+                return "amendment_signature"
+            return "signature"
+        if request:
+            return "request"
+        if delivery:
+            return "delivery"
     return ""
 
 
-def _event_dates(query: str) -> tuple[tuple[tuple[date, date], ...], str, bool]:
+def _event_dates(query: str, default_year: int | None = None) -> tuple[tuple[tuple[date, date], ...], str, bool]:
     text = _normalize(query)
-    mentions = [(start, end, (value, value)) for start, end, value in _date_mentions(text)]
+    mentions = [(start, end, (value, value)) for start, end, value in _query_date_mentions(text, default_year)]
     for pattern in (_MONTH_YEAR, _YEAR):
         for match in pattern.finditer(text):
             start, end = match.span()
@@ -296,7 +341,8 @@ def _event_dates(query: str) -> tuple[tuple[tuple[date, date], ...], str, bool]:
                 period = date(year, 1, 1), date(year, 12, 31)
             mentions.append((start, end, period))
     dates = []
-    for start, end, period in sorted(mentions):
+    mentions.sort()
+    for index, (start, end, period) in enumerate(mentions):
         left = text[max(0, start - 20):start]
         right = text[end:end + 20]
         qualifier_match = re.search(r"\b(не позднее|не после|начиная с|не ранее|после|до)\s*$", left)
@@ -308,24 +354,37 @@ def _event_dates(query: str) -> tuple[tuple[tuple[date, date], ...], str, bool]:
             period = date.min, period[1] if inclusive else period[0] - timedelta(days=1)
         elif qualifier in {"начиная с", "не ранее"}:
             period = period[0], date.max
-        dates.append((period, _event_role(text, start, end)))
+        previous_end = mentions[index - 1][1] if index else 0
+        next_start = mentions[index + 1][0] if index + 1 < len(mentions) else len(text)
+        between = text[previous_end:start]
+        before = _DATE_CLAUSE.split(between[-95:])[-1]
+        after = _DATE_CLAUSE.split(text[end:min(next_start, end + 45)], maxsplit=1)[0].split(",", 1)[0]
+        role = _event_role(before, after)
+        if not role and dates and (re.fullmatch(r"\s*(?:и|или|,|-)\s*", between) or _FOLLOWING_ITEM.fullmatch(between)):
+            role = dates[-1][1]
+        dates.append((period, role))
+    actual = [item for item in dates if item[1] != "document"]
+    if actual:
+        dates = actual
     compared = len(dates) > 1 and bool(_DATE_COMPARISON.search(text))
     if not compared and len(dates) > 1:
-        actual = [item for item in dates if item[1] != "document"]
-        if actual:
-            dates = actual
         desired_role = next((role for marker, role in (
             (r"на\s+дату\s+подписания\s+спецификаци\w*", "specification"),
             (r"на\s+дату\s+подписания\s+доп(?:олнительного)?\s*соглашени\w*", "amendment_signature"),
             (r"на\s+дату\s+(?:отгрузки|поставки|доставки)", "delivery"),
             (r"на\s+дату\s+(?:подписания|заключения)\s+договора", "signature"),
         ) if re.search(marker, text)), "")
+        roles = {role for _, role in dates}
+        if not desired_role and roles == {"request", "signature"}:
+            desired_role = "signature"
+        if not desired_role and roles == {"delivery", "specification"}:
+            desired_role = "specification"
         selected = [item for item in dates if item[1] == desired_role] if desired_role else []
-        if len(selected) == 1:
+        if selected:
             dates = selected
     periods = tuple(dict.fromkeys(period for period, _ in dates))
     roles = {role for _, role in dates}
-    return periods, next(iter(roles)) if len(roles) == 1 else "", compared or len(periods) > 1
+    return periods, next(iter(roles)) if len(roles) == 1 else "", compared or (len(periods) > 1 and len(roles) == 1)
 
 
 def _number_groups(pattern: re.Pattern[str], text: str) -> Iterator[tuple[str, int, int]]:
@@ -408,14 +467,19 @@ def _make_document(doc_id: str, filename: str, text: str) -> Document:
     effective_to = _date_after(_EXPIRES, edition_note)
     first_reference = next(_ID.finditer(_normalize("\n".join(lines[:4]))), None)
     reference = _reference(first_reference) if first_reference else ""
+    effective_event = ""
     if short_name.lower().startswith("договор") and (contract := _ID.search(lines[0])):
         title = _ID.sub(lambda _: "№ " + contract[0], title, count=1)
     elif short_name.lower().startswith("доп соглашение"):
         title = " ".join(lines[:2])
     if short_name.lower().startswith("письмо"):
-        effective_from = next((_first_date(line) for line in lines if re.match(r"^С\s+\d", line)), effective_from)
+        if operative := next((line for line in lines if re.match(r"^С\s+\d", line)), ""):
+            effective_from = _first_date(operative) or effective_from
+            if re.search(r"\bдо подписания (?:\w+ )?договора\b", operative, re.I):
+                effective_event = "signature"
     return Document(doc_id, title, text, filename, "corporate", effective_from=effective_from,
-                    effective_to=effective_to, edition_note=edition_note, reference=reference)
+                    effective_to=effective_to, edition_note=edition_note, reference=reference,
+                    effective_event=effective_event)
 
 
 def _lines(document: Document) -> list[str]:
@@ -675,7 +739,7 @@ class Corpus:
                 typo.add(org)
         return exact, typo - exact, ambiguous - exact
 
-    def scope(self, query: str) -> SearchScope:
+    def scope(self, query: str, *, default_year: int | None = None) -> SearchScope:
         normalized = _normalize(query)
         exact_docs, inferred_docs, ref_docs, unresolved = [], [], [], []
         for match in _ID.finditer(normalized):
@@ -701,7 +765,7 @@ class Corpus:
                 exact_org.update(matching)
         exact_docs.extend(doc_id for org in sorted(exact_org) for doc_id in self._organizations[org])
         inferred_docs.extend(doc_id for org in sorted(typo_org | ambiguous_org) for doc_id in self._organizations[org])
-        ranges, role, comparison = _event_dates(query)
+        ranges, role, comparison = _event_dates(query, default_year)
         return SearchScope(
             document_ids=tuple(dict.fromkeys(exact_docs + inferred_docs)),
             exact_document_ids=tuple(dict.fromkeys(exact_docs)),
@@ -720,6 +784,8 @@ class Corpus:
             return "unknown"
         start, end = scope.date_ranges[0]
         document = self.documents[passage.document_id]
+        if document.effective_event and scope.event_role not in {"", document.effective_event}:
+            return "unknown"
         if scope.event_role == "specification":
             if boundary := self._amendment_dates.get(passage.id):
                 return "inapplicable" if end <= boundary else "applicable" if start > boundary else "unknown"

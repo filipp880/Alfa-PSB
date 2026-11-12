@@ -224,21 +224,46 @@ class LegalAssistant:
             if cache:
                 self.store_embeddings(cache, ids)
 
-    def scope_for(self, question: str, history: list[dict[str, str]]) -> SearchScope:
-        scope = self.corpus.scope(question)
-        if scope.document_ids or scope.ambiguous_entities or scope.unresolved_references or not CONTINUATION.search(question):
-            return scope
+    def _prior_turns(self, question: str, history: list[dict[str, str]],
+                     scope: SearchScope) -> list[tuple[str, SearchScope]]:
+        if scope.ambiguous_entities or scope.unresolved_references or not CONTINUATION.search(question):
+            return []
+        turns = []
         for turn in reversed(history):
             if turn["role"] != "user":
                 continue
             prior = self.corpus.scope(turn["text"])
-            exact = prior.exact_document_ids
-            references = {self.corpus.documents[doc_id].reference for doc_id in exact}
-            if (not prior.ambiguous_entities and not prior.unresolved_references
-                    and (len(exact) == 1 or len(references) == 1 and "" not in references)):
-                return replace(scope, document_ids=exact, exact_document_ids=exact)
-            if prior.document_ids or prior.ambiguous_entities or prior.unresolved_references:
+            if prior.ambiguous_entities or prior.unresolved_references:
                 break
+            if scope.document_ids and prior.document_ids and not set(scope.document_ids).intersection(prior.document_ids):
+                break
+            turns.append((turn["text"], prior))
+            if prior.document_ids:
+                break
+        return turns
+
+    def scope_for(self, question: str, history: list[dict[str, str]]) -> SearchScope:
+        scope = self.corpus.scope(question)
+        turns = self._prior_turns(question, history, scope)
+        if not turns:
+            return scope
+        if not scope.document_ids:
+            exact = turns[-1][1].exact_document_ids
+            references = {self.corpus.documents[doc_id].reference for doc_id in exact}
+            if len(exact) == 1 or len(references) == 1 and "" not in references:
+                scope = replace(scope, document_ids=exact, exact_document_ids=exact)
+        prior = next((item for _, item in turns if item.date_ranges and item.event_role != "document"), None)
+        if prior is None or prior.comparison or scope.comparison:
+            return scope
+        if not scope.date_ranges and len(prior.date_ranges) == 1:
+            start, end = prior.date_ranges[0]
+            inferred = self.corpus.scope(question, default_year=start.year) if start.year == end.year else scope
+            if inferred.date_ranges:
+                return replace(scope, date_ranges=inferred.date_ranges,
+                               event_role=inferred.event_role or prior.event_role, comparison=inferred.comparison)
+            return replace(scope, date_ranges=prior.date_ranges, event_role=prior.event_role)
+        if not scope.event_role:
+            return replace(scope, event_role=prior.event_role)
         return scope
 
     def retrieve(self, question: str, history: list[dict[str, str]], deadline: float,
@@ -256,11 +281,7 @@ class LegalAssistant:
                   scope: SearchScope) -> list[Passage]:
         limit = max(18, self.settings.top_k)
         lexical = self.corpus.search(question, limit, scope=scope)
-        context = "\n".join(turn["text"] for turn in history if turn["role"] == "user")
-        if not context and history:
-            context = history[-1]["text"]
-        elif len(question) < 145 and history and history[-1]["role"] == "assistant":
-            context += "\n" + history[-1]["text"][:360]
+        context = "\n".join(text for text, _ in reversed(self._prior_turns(question, history, scope)))
         enriched = f"{question}\n{context}" if context else question
         rankings = [(1.05 if context else 1.25, lexical)]
         if context:

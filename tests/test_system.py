@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import date
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -116,6 +117,28 @@ class SystemTests(unittest.TestCase):
         explicit = "А как доставлять по ПТ-05/2023?"
         self.assertEqual(assistant.scope_for(explicit, history).exact_document_ids,
                          self.corpus.scope(explicit).exact_document_ids)
+
+    def test_follow_up_uses_user_dates_and_honors_a_new_contract(self):
+        assistant = LegalAssistant(self.corpus, Settings(), offline=True)
+        history = [
+            {"role": "user", "text": "Спецификацию по П-17/2024 подписали 1 октября 2024."},
+            {"role": "assistant", "text": "Новый адрес в Химках по договору ПТ-05/2023."},
+        ]
+        amendment = next(p for p in self.corpus.passages.values() if p.locator == "изменение п. 3.2")
+        for latest, day, applicability in (
+            ("А куда везти по этому договору?", 1, "inapplicable"),
+            ("А если 2 октября, куда везти?", 2, "applicable"),
+        ):
+            with self.subTest(latest=latest):
+                scope = assistant.scope_for(latest, history)
+                self.assertEqual(scope.event_role, "specification")
+                self.assertEqual(scope.date_ranges, ((date(2024, 10, day), date(2024, 10, day)),))
+                self.assertEqual(self.corpus.applicability(amendment, scope), applicability)
+                self.assertEqual(assistant.retrieve(latest, history, 0),
+                                 assistant.retrieve(latest, history[:1], 0))
+        latest = "А как доставлять по ПТ-05/2023?"
+        self.assertEqual(assistant.scope_for(latest, history), assistant.scope_for(latest, []))
+        self.assertEqual(assistant.retrieve(latest, history, 0), assistant.retrieve(latest, [], 0))
 
     def test_verification_failure_does_not_publish_claims(self):
         assistant = LegalAssistant(self.corpus, Settings(base_url="http://localhost", key="fixture", model="fixture"))
@@ -254,6 +277,36 @@ class SystemTests(unittest.TestCase):
                              "evidence": [base.id, amendment.id]}]}
         claim, = assistant.validated_claims(draft, {p.id: p for p in (base, amendment)}, scope)
         self.assertEqual([citation.id for citation in claim.citations], [base.id, amendment.id])
+
+    def test_addresses_and_transition_survive_the_model_and_csv_path(self):
+        assistant = LegalAssistant(self.corpus, Settings(base_url="http://localhost", key="fixture",
+                                                        model="fixture", retry_search=False))
+        base, amendment = [next(p for p in self.corpus.passages.values() if p.locator == locator
+                                and self.corpus.documents[p.document_id].reference == "п-17/2024")
+                           for locator in ("п. 3.2", "изменение п. 3.2")]
+        for day, active, address, inactive, wrong_address in (
+            (1, base, "Москва, ул. Складская, д. 4, стр. 2",
+             amendment, "Московская область, г. Химки, ул. Заводская, д. 15, склад № 3"),
+            (2, amendment, "Московская область, г. Химки, ул. Заводская, д. 15, склад № 3",
+             base, "Москва, ул. Складская, д. 4, стр. 2"),
+        ):
+            with self.subTest(day=day):
+                question = f"Куда везти товар по П-17/2024, если спецификацию подписали {day} октября 2024?"
+                draft = {"status": "answered", "claims": [
+                    {"text": address, "evidence": [active.id, amendment.id] if day == 1 else [active.id]},
+                    {"text": wrong_address, "evidence": [inactive.id]},
+                ], "gap": ""}
+                with patch.object(assistant.gateway, "chat", side_effect=[draft, {"supported": [0]}]) as gateway:
+                    answer = assistant.ask(question)
+                generation = gateway.call_args_list[0].args[1]
+                by_id = {p["id"]: p for p in generation["passages"]}
+                self.assertEqual(by_id[inactive.id]["applicability"], "inapplicable")
+                self.assertIn("подписаны после 1 октября 2024", by_id[amendment.id]["text"])
+                verification = gateway.call_args_list[1].args[1]
+                self.assertEqual([claim["text"] for claim in verification["claims"]], [address])
+                self.assertEqual(answer.status, "partial")
+                self.assertIn(address, answer.csv_text())
+                self.assertNotIn(wrong_address, answer.csv_text())
 
     def test_chat_repairs_truncation_and_handles_incompatible_optional_parameters(self):
         gateway = Gateway(Settings(key="fixture", model="fixture"))

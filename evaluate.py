@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from contextlib import ExitStack, contextmanager
+from dataclasses import asdict
 import json
 import math
 import os
@@ -29,6 +30,7 @@ ROOT = Path(__file__).resolve().parent
 HYPHENS = str.maketrans("ё‐‒–—−", "е-----")
 ENDPOINTS = ("/chat/completions", "/embeddings", "/rerank")
 NO_ANSWER_STATUSES = {"refusal", "insufficient", "clarification", "out_of_scope"}
+PASSAGE_MARKER = re.compile(r"\[(P\d+)\]")
 
 
 def normalized(text: str) -> str:
@@ -46,9 +48,13 @@ def read_cases(path: Path, ids: list[str]) -> list[dict]:
     if unknown:
         raise ValueError(f"Неизвестные ID проверок: {', '.join(sorted(unknown))}")
     for case in cases:
-        for pattern in case["must"]:
+        assertions = case.get("assertions", [])
+        patterns = case["must"] + case.get("must_not", [])
+        patterns.extend(pattern for item in assertions for pattern in item["must"])
+        for pattern in patterns:
             re.compile(pattern)
-        if any(not 0 <= index < len(case["evidence"]) for index in case.get("cite", [])):
+        indices = [*case.get("cite", []), *(index for item in assertions for index in item["cite"])]
+        if any(not 0 <= index < len(case["evidence"]) for index in indices):
             raise ValueError(f"Неверный индекс эталонной ссылки в {case['id']}.")
     return [case for case in cases if not ids or case["id"] in ids]
 
@@ -77,7 +83,8 @@ def hits(ids: set[str], slots: list[set[str]]) -> list[bool]:
 
 def grade_answer(answer, case: dict, slots: list[set[str]], corpus) -> dict:
     status = answer.status if answer is not None else "error"
-    text = normalized(answer.text) if answer is not None else ""
+    answer_text = answer.text if answer is not None else ""
+    text = normalized(answer_text)
     missing_patterns = [pattern for pattern in case["must"] if not re.search(pattern, text)]
     citations = answer.citations if answer is not None else []
     valid_citations = [
@@ -89,11 +96,23 @@ def grade_answer(answer, case: dict, slots: list[set[str]], corpus) -> dict:
     valid_ids = {citation.id for citation in valid_citations}
     required_cites = case.get("cite", range(len(slots)))
     missing_citations = [index for index in required_cites if not (valid_ids & slots[index])]
+    missing_assertions = []
+    if assertions := case.get("assertions"):
+        blocks = [(normalized(PASSAGE_MARKER.sub("", block)), valid_ids.intersection(PASSAGE_MARKER.findall(block)))
+                  for block in answer_text.split("\n\n")]
+        for index, item in enumerate(assertions):
+            candidates = [block for block, ids in blocks if all(ids & slots[slot] for slot in item["cite"])]
+            if item.get("same_clause"):
+                candidates = [clause for block in candidates for clause in re.split(r";|,(?!\d)", block)]
+            if not any(all(re.search(pattern, block) for pattern in item["must"]) for block in candidates):
+                missing_assertions.append(index)
     return {
         "status": status,
         "status_ok": status in case["statuses"],
         "unwanted_no_answer": status in NO_ANSWER_STATUSES and status not in case["statuses"],
         "missing_patterns": missing_patterns,
+        "forbidden_patterns": [pattern for pattern in case.get("must_not", []) if re.search(pattern, text)],
+        "missing_assertions": missing_assertions,
         "missing_citations": missing_citations,
         "invalid_citations": len(citations) - len(valid_citations),
         "requires_citations": bool(required_cites),
@@ -101,8 +120,8 @@ def grade_answer(answer, case: dict, slots: list[set[str]], corpus) -> dict:
 
 
 def passed(grade: dict) -> bool:
-    return (grade["status_ok"] and not grade["missing_patterns"]
-            and not grade["missing_citations"] and not grade["invalid_citations"])
+    return (grade["status_ok"] and not grade["missing_patterns"] and not grade["forbidden_patterns"]
+            and not grade["missing_citations"] and not grade["invalid_citations"] and not grade["missing_assertions"])
 
 
 def request_counts(assistant) -> Counter | None:
@@ -117,12 +136,17 @@ def request_delta(before: Counter | None, after: Counter | None) -> dict | None:
     return dict(after - before) if before is not None and after is not None else None
 
 
-def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[int], timeout: float) -> dict:
+def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[int], timeout: float,
+                       *, audit: bool = False, reference_context: bool = False) -> dict:
     retrieve, select = live.retrieve, live.context
     answer_once = getattr(live, "_answer_once", None)
     rankings, contexts = [], []
     initial_answer = None
     retry_start = None
+    stages = []
+    reference_passages = list(dict.fromkeys(
+        min(slot, key=lambda pid: (len(live.corpus.passages[pid].text), pid)) for slot in slots if slot
+    )) if reference_context else []
 
     def capture_retrieval(*args, **kwargs):
         found = retrieve(*args, **kwargs)
@@ -133,7 +157,8 @@ def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[in
         nonlocal retry_start
         if len(contexts) == 1:
             retry_start = request_counts(live)
-        selected = select(*args, **kwargs)
+        selected = ([live.corpus.passages[pid] for pid in reference_passages]
+                    if reference_context else select(*args, **kwargs))
         contexts.append(selected)
         return selected
 
@@ -144,6 +169,20 @@ def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[in
             initial_answer = result[0]
         return result
 
+    chat = live.gateway.chat
+
+    def capture_chat(system, user, deadline, *, verify=False):
+        result = chat(system, user, deadline, verify=verify)
+        keys = ("supported", "gap_ok") if verify else ("status", "claims", "gap", "look_for")
+        output = {key: result[key] for key in keys if key in result}
+        if isinstance(output.get("claims"), list):
+            output["claims"] = [
+                {key: claim[key] for key in ("text", "evidence") if key in claim}
+                for claim in output["claims"] if isinstance(claim, dict)
+            ]
+        stages.append({"stage": "verify" if verify else "draft", "output": output})
+        return result
+
     before = request_counts(live)
     error_type = None
     started = time.perf_counter()
@@ -152,6 +191,8 @@ def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[in
         stack.enter_context(patch.object(live, "context", capture_context))
         if callable(answer_once):
             stack.enter_context(patch.object(live, "_answer_once", capture_answer))
+        if audit:
+            stack.enter_context(patch.object(live.gateway, "chat", capture_chat))
         try:
             answer = live.ask(case["question"], deadline=time.monotonic() + timeout)
         except Exception as exc:
@@ -165,6 +206,7 @@ def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[in
     retried = len(contexts) > 1
     return {
         **grade,
+        "reference_context": reference_context,
         "elapsed_seconds": round(elapsed, 4),
         "exception_type": error_type,
         "ranked": {k: hits({p.id for p in ranked[:k]}, slots) for k in cutoffs},
@@ -174,6 +216,13 @@ def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[in
         "retry_recovered": not passed(initial) and passed(grade) if retried and initial is not None else None,
         "requests": request_delta(before, after),
         "retry_requests": request_delta(retry_start, after),
+        **({"audit": {
+            "answer": answer.text if answer is not None else "",
+            "csv_answer": answer.csv_text() if answer is not None else "",
+            "citations": [asdict(citation) for citation in answer.citations] if answer is not None else [],
+            "context_ids": [[p.id for p in selection] for selection in contexts],
+            "stages": stages,
+        }} if audit else {}),
     }
 
 
@@ -220,7 +269,8 @@ def evaluate(args: argparse.Namespace, cases: list[dict]) -> dict:
             "search_ms": round((time.perf_counter() - started) * 1000, 2),
         }
         if live is not None:
-            result["live"] = evaluate_live_case(live, case, slots, args.k, args.timeout)
+            result["live"] = evaluate_live_case(live, case, slots, args.k, args.timeout, audit=args.audit,
+                                                reference_context=args.reference_context)
         results.append(result)
     return {
         "live_ready": live is not None,
@@ -262,6 +312,10 @@ def run_candidate(path: Path, args: argparse.Namespace) -> dict:
             command.extend(("--case", case))
         if args.live:
             command.append("--live")
+        if args.audit:
+            command.extend(("--audit", "--json"))
+        if args.reference_context:
+            command.append("--reference-context")
         completed = subprocess.run(
             command,
             cwd=directory,
@@ -307,7 +361,8 @@ def metrics(run: dict, cutoffs: list[int]) -> dict:
         "median_search_ms": statistics.median(row["search_ms"] for row in rows),
         "live_cases": len(online),
         "live_status_ok": sum(row["status_ok"] for row in online),
-        "live_facts_ok": sum(not row["missing_patterns"] for row in online),
+        "live_facts_ok": sum(not row["missing_patterns"] and not row["forbidden_patterns"]
+                             and not row["missing_assertions"] for row in online),
         "live_citations_ok": sum(not row["missing_citations"] and not row["invalid_citations"] for row in online),
         "live_cases_requiring_citations": len(online_required_citations),
         "live_supported": sum(not row["missing_citations"] and not row["invalid_citations"]
@@ -355,6 +410,8 @@ def print_result(label: str, run: dict, cases: list[dict], args: argparse.Namesp
     print(f"  Медиана {m['median_context_size']:g} фрагм. и {m['median_context_chars']:g} знаков в контексте, "
           f"{m['median_search_ms']:g} мс на поиск и сбор")
     if m["live_cases"]:
+        if args.reference_context:
+            print("  Генерация получила только размеченные эталонные фрагменты.")
         live_total = m["live_cases"]
         print(f"  API: статус {m['live_status_ok']}/{live_total}, шаблоны {m['live_facts_ok']}/{live_total}, "
               f"источники {m['live_citations_ok']}/{live_total}, всё вместе {m['live_pass']}/{live_total}")
@@ -388,6 +445,8 @@ def print_result(label: str, run: dict, cases: list[dict], args: argparse.Namesp
             if "live" in result:
                 live = result["live"]
                 print(f"      статус {live['status']}, шаблонов пропущено {len(live['missing_patterns'])}, "
+                      f"провалено проверок вывода {len(live['missing_assertions'])}, "
+                      f"запрещённых совпадений {len(live['forbidden_patterns'])}, "
                       f"источников пропущено {len(live['missing_citations'])}, "
                       f"некорректных цитат {live['invalid_citations']}")
                 print(f"      время {live['elapsed_seconds']:g} с, запросы {format_requests(live['requests'])}")
@@ -414,8 +473,16 @@ def main() -> None:
     parser.add_argument("--live", action="store_true", help="Дополнительно вызвать настроенный API модели")
     parser.add_argument("--details", action="store_true", help="Вывести отсутствующие фрагменты по сценариям")
     parser.add_argument("--json", action="store_true", help="Вывести метрики и оценки в JSON")
+    parser.add_argument("--audit", action="store_true",
+                        help="Включить в JSON тексты ответов, цитаты и структурированные результаты генерации и проверки")
+    parser.add_argument("--reference-context", action="store_true",
+                        help="Диагностический прогон генерации только с эталонными фрагментами разметки")
     parser.add_argument("--implementation", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.audit and not (args.live and args.json):
+        parser.error("--audit требует --live и --json")
+    if args.reference_context and not args.live:
+        parser.error("--reference-context требует --live")
     if any(k < 1 for k in args.k) or not 0 < args.timeout <= 120:
         parser.error("Глубины должны быть положительными, таймаут должен быть больше 0 и не более 120 с.")
     args.k = list(dict.fromkeys(args.k))

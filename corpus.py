@@ -80,7 +80,12 @@ _YEAR = re.compile(r"\b(?:в|за|на)\s+(20\d{2})\b|\b(20\d{2})\s*(?:год[а
 _WORD = re.compile(r"[а-яa-z]+|\d+(?:[.,]\d+)?")
 _ENTITY = re.compile(r"\b[а-яa-z]+(?:-[а-яa-z]+)+\b")
 _ORG_QUOTE = re.compile(r"[«\"“]([^»\"”\n]{2,80})[»\"”]")
-_ID = re.compile(r"(?<!\w)([а-яa-z]{1,4})-\s*(\d+)(?:[/\-](20\d{2}))?(?!\w)", re.I)
+_ID = re.compile(r"(?<!\w)([а-яa-z]{1,4})\s*-\s*(\d+)(?:\s*[/\-]\s*(20\d{2}))?(?!\w)", re.I)
+# NFKC turns the number sign (№) into "No", which is lowercased before matching.
+_DOCUMENT_DATE = re.compile(
+    r"\b(?:договор\w*|контракт\w*|регламент\w*|редакци\w*|(?:доп\w*\s*)?соглашени\w*)"
+    rf"(?:\s+[а-яa-z]+){{0,3}}\s+(?:(?:no\s*)?{_ID.pattern}\s+|no\s*[а-яa-z\d/-]+\s+)?от\s*$"
+)
 _ARTICLE = re.compile(r"\b(?:стать(?:я|и|е|ю|ей|ями|ях|ям)|ст\.?)\s*(\d+(?:\.\d+)*)", re.I)
 _POINT = re.compile(r"\b(?:пункт\w*|част[ьи]|п\.|ч\.)\s*(\d+(?:\.\d+)*)", re.I)
 _NUMBER_TAIL = re.compile(r"\s*(?:,\s*|\b(?:и|или)\s+)(\d+(?:\.\d+)*)(?![\d./-])", re.I)
@@ -258,6 +263,8 @@ def _event_role(text: str, start: int, end: int) -> str:
     left = text[max(0, start - 75):start]
     left = re.split(r"[!?;\n]|\.(?=\s)", left)[-1]
     right = text[end:end + 35]
+    if _DOCUMENT_DATE.search(left):
+        return "document"
     if re.search(r"\bспецификаци\w*\b", left) and re.search(
         r"\b(?:подпис\w*|заключ\w*|от)\b", left
     ):
@@ -268,8 +275,6 @@ def _event_role(text: str, start: int, end: int) -> str:
         return "signature"
     if re.search(r"\b(?:достав\w*|отгруз\w*|постав\w*)\b[^.!?]{0,28}$", left):
         return "delivery"
-    if re.search(r"\b(?:договор\w*|регламент\w*|редакци\w*)\s+(?:№\s*[а-яa-z\d/-]+\s+)?от\s*$", left):
-        return "document"
     if re.match(r"\s*(?:был[аио]?\s+)?подпис\w*\s+спецификаци\w*", right):
         return "specification"
     return ""
@@ -677,7 +682,7 @@ class Corpus:
             reference = _reference(match)
             if ids := self._references.get(reference):
                 ref_docs.extend(ids)
-            elif match[3] or re.search(r"(?:№\s*|договор\w*\s+)$", normalized[max(0, match.start() - 22):match.start()]):
+            elif match[3] or re.search(r"(?:\bno\s*|договор\w*\s+)$", normalized[max(0, match.start() - 22):match.start()]):
                 unresolved.append(reference)
         exact_docs.extend(ref_docs)
         for number, start, end in _number_groups(_ARTICLE, normalized):

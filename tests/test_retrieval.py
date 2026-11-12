@@ -45,6 +45,14 @@ class RetrievalTests(unittest.TestCase):
                 unknown = corpus.scope(f"Кто ремонтирует крышу по договору АР{dash}441/2022?")
                 self.assertEqual(unknown.unresolved_references, ("ар-441/2022",))
 
+    def test_spaced_contract_references_preserve_the_year(self):
+        corpus = self.corpus
+        known = corpus.scope("Какой обеспечительный платёж по договору № А - 08 / 2024?")
+        self.assertEqual([corpus.documents[key].reference for key in known.exact_document_ids], ["а-08/2024"])
+        missing = corpus.scope("Есть ли договор А - 08 / 2022 и письмо № К - 900?")
+        self.assertFalse(missing.exact_document_ids)
+        self.assertEqual(missing.unresolved_references, ("а-08/2022", "к-900"))
+
     def test_scope_preserves_comparison_dates_and_sources(self):
         query = ("Сравните оплату у «Альфа-Трейд» на 28 февраля 2025 и у «Альфа-Трейдинг» на 1 марта 2025.")
         scope = self.corpus.scope(query)
@@ -81,6 +89,26 @@ class RetrievalTests(unittest.TestCase):
         )
         self.assertEqual(scope.event_role, "amendment_signature")
         self.assertEqual(scope.date_ranges, ((date(2025, 3, 2), date(2025, 3, 2)),))
+
+    def test_specification_date_controls_the_amendment_despite_document_date(self):
+        corpus = self.corpus
+        base, amendment = [next(p for p in corpus.passages.values() if p.locator == locator and
+                                corpus.documents[p.document_id].reference == "п-17/2024")
+                           for locator in ("п. 3.2", "изменение п. 3.2")]
+        for day in (1, 2):
+            with self.subTest(day=day):
+                scope = corpus.scope(
+                    "Договор поставки № П - 17 / 2024 от 12.02.2024. "
+                    f"Куда везти партию по спецификации от {day} октября 2024?"
+                )
+                self.assertEqual(scope.event_role, "specification")
+                self.assertEqual(scope.date_ranges, ((date(2024, 10, day), date(2024, 10, day)),))
+                self.assertFalse(scope.comparison)
+                expected = ("applicable", "inapplicable") if day == 1 else ("inapplicable", "applicable")
+                self.assertEqual(tuple(corpus.applicability(p, scope) for p in (base, amendment)), expected)
+
+        document_only = corpus.scope("Что сказано в регламенте согласования договоров № 42 от 01.03.2025?")
+        self.assertEqual(document_only.event_role, "document")
 
     def test_explicit_cross_reference_and_consecutive_list(self):
         corpus = self.corpus

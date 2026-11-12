@@ -103,6 +103,20 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(answer.status, "offline")
         self.assertTrue(any(c.locator == "п. 6.3" and "акт" in c.quote.lower() for c in answer.citations))
 
+    def test_follow_up_inherits_a_contract_with_an_amendment(self):
+        assistant = LegalAssistant(self.corpus, Settings(), offline=True)
+        history = [{"role": "user", "text": "Мы подписали спецификацию по П-17/2024."},
+                   {"role": "assistant", "text": "Сроки по ПТ-05/2023 могут отличаться."}]
+        original = self.corpus.scope(history[0]["text"]).exact_document_ids
+        self.assertEqual(len(original), 2)
+        self.assertEqual(assistant.scope_for("А куда доставлять по этому договору?", history).exact_document_ids,
+                         original)
+        switched = history + [{"role": "user", "text": "Теперь речь о договоре П-99/2024."}]
+        self.assertFalse(assistant.scope_for("А куда доставлять по этому договору?", switched).exact_document_ids)
+        explicit = "А как доставлять по ПТ-05/2023?"
+        self.assertEqual(assistant.scope_for(explicit, history).exact_document_ids,
+                         self.corpus.scope(explicit).exact_document_ids)
+
     def test_verification_failure_does_not_publish_claims(self):
         assistant = LegalAssistant(self.corpus, Settings(base_url="http://localhost", key="fixture", model="fixture"))
         passage = next(p for p in self.corpus.search(RENT, 12) if RENT_QUOTE in p.text)
@@ -113,6 +127,28 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(answer.status, "error")
         self.assertNotIn("450 000", answer.text)
         self.assertFalse(answer.citations)
+
+    def test_insufficient_draft_can_still_answer_a_verified_part(self):
+        assistant = LegalAssistant(
+            self.corpus, Settings(base_url="http://localhost", key="fixture", model="fixture", retry_search=False)
+        )
+        passage = next(p for p in self.corpus.search(RENT, 12) if RENT_QUOTE in p.text)
+        draft = {
+            "status": "insufficient",
+            "claims": [
+                {"text": AMOUNT, "evidence": [passage.id]},
+                {"text": "Обеспечительный платёж составляет 500 000 рублей.", "evidence": [passage.id]},
+            ],
+            "gap": "История перечислений арендатора в базе отсутствует.",
+        }
+        with patch.object(assistant.gateway, "chat", side_effect=[draft, {"supported": [0], "gap_ok": True}]) as chat:
+            answer = assistant.ask(RENT + " В каком месяце арендатор последний раз перечислил деньги?")
+        self.assertEqual(answer.status, "partial")
+        self.assertEqual([citation.id for citation in answer.citations], [passage.id])
+        self.assertIn(AMOUNT, answer.text)
+        self.assertIn(draft["gap"], answer.text)
+        self.assertNotIn("500 000", answer.text)
+        self.assertTrue(chat.call_args.kwargs["verify"])
 
     def test_mistyped_quote_is_replaced_by_verbatim_verified_passage(self):
         assistant = LegalAssistant(self.corpus, Settings(base_url="http://localhost", key="fixture", model="fixture"))
@@ -192,6 +228,32 @@ class SystemTests(unittest.TestCase):
         draft = {"claims": [{"text": "Нужен адрес в Химках.", "evidence": [amendment.id]}]}
         self.assertEqual(self.corpus.applicability(amendment, scope), "inapplicable")
         self.assertEqual(assistant.validated_claims(draft, {amendment.id: amendment}, scope), [])
+
+    def test_wrong_edition_is_removed_from_mixed_support(self):
+        assistant = LegalAssistant(self.corpus, Settings())
+        scope = assistant.scope_for("Нужно ли одобрение гендиректора, если договор заключили 28.02.2025?", [])
+        old, new = [next(p for p in self.corpus.passages.values() if p.locator == "п. 2.4"
+                         and edition in self.corpus.documents[p.document_id].title)
+                    for edition in ("ред 2023", "ред 2025")]
+        sources = {p.id: p for p in (old, new)}
+        draft = {"claims": [{"text": "Применяется порог 10 000 000 рублей.", "evidence": [old.id, new.id]}]}
+        claim, = assistant.validated_claims(draft, sources, scope)
+        self.assertEqual([citation.id for citation in claim.citations], [old.id])
+        comparison = assistant.scope_for(
+            "Сравните пороги одобрения для договоров, подписанных 28.02.2025 и 01.03.2025.", [])
+        claim, = assistant.validated_claims(draft, sources, comparison)
+        self.assertEqual([citation.id for citation in claim.citations], [old.id, new.id])
+
+    def test_transition_rule_can_explain_why_amendment_does_not_apply(self):
+        assistant = LegalAssistant(self.corpus, Settings())
+        scope = assistant.scope_for("Куда везти товар по П-17/2024, если спецификацию подписали 01.10.2024?", [])
+        base, amendment = [next(p for p in self.corpus.passages.values() if p.locator == locator
+                                and self.corpus.documents[p.document_id].reference == "п-17/2024")
+                           for locator in ("п. 3.2", "изменение п. 3.2")]
+        draft = {"claims": [{"text": "Применяется адрес в Москве: спецификация подписана 1 октября.",
+                             "evidence": [base.id, amendment.id]}]}
+        claim, = assistant.validated_claims(draft, {p.id: p for p in (base, amendment)}, scope)
+        self.assertEqual([citation.id for citation in claim.citations], [base.id, amendment.id])
 
     def test_chat_repairs_truncation_and_handles_incompatible_optional_parameters(self):
         gateway = Gateway(Settings(key="fixture", model="fixture"))

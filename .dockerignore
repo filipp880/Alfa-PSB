@@ -4,8 +4,10 @@
 !corpus.py
 !proxy.py
 !solution.py
+!telemetry.py
 !web.py
 !requirements.txt
+!requirements-dev.txt
 !static/
 !static/**
 !data/

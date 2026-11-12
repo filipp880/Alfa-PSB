@@ -6,11 +6,17 @@ import json
 import logging
 import math
 import os
+import random
+import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field
+from threading import Lock
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from telemetry import span
 
 LOG = logging.getLogger(__name__)
 
@@ -44,7 +50,10 @@ class Settings:
     workers: int = 6
     top_k: int = 18
     rerank_top_n: int = 10
-    json_mode: bool = False
+    json_mode: bool = True
+    thinking: str = "auto"
+    retry_search: bool = True
+    embed_cache: str = ""
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -66,7 +75,10 @@ class Settings:
             workers=bounded("MAX_WORKERS", 6, 1, 8),
             top_k=bounded("TOP_K", 18, 4, 32),
             rerank_top_n=bounded("RERANKER_TOP_N", 10, 2, 24),
-            json_mode=env("LLM_JSON_MODE") == "1",
+            json_mode=env("LLM_JSON_MODE", default="1") != "0",
+            thinking=env("LLM_THINKING", default="auto").casefold(),
+            retry_search=env("RAG_RETRY_SEARCH", default="1") != "0",
+            embed_cache=env("PSB_EMBED_CACHE_DIR"),
         )
 
     @property
@@ -82,9 +94,10 @@ class Settings:
 
 
 class GatewayError(Exception):
-    def __init__(self, endpoint: str, status: int | None = None):
-        super().__init__(f"{endpoint}: {status if status is not None else 'некорректный ответ или тайм-аут'}")
+    def __init__(self, endpoint: str, status: int | None = None, reason: str = "invalid_response"):
+        super().__init__(f"{endpoint}: {status if status is not None else reason}")
         self.status = status
+        self.reason = reason
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -95,6 +108,13 @@ class NoRedirect(HTTPRedirectHandler):
 class Gateway:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self._lock = Lock()
+        self._requests: Counter[str] = Counter()
+        self._unsupported: set[str] = set()
+
+    def request_counts(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._requests)
 
     def _post(self, endpoint: str, key: str, payload: dict, deadline: float,
               timeout: float, *, retry: bool = False) -> dict:
@@ -108,23 +128,34 @@ class Gateway:
         for attempt in range(2 if retry else 1):
             remaining = deadline - time.monotonic()
             if remaining < 0.2:
-                raise GatewayError(endpoint)
+                raise GatewayError(endpoint, reason="deadline")
+            delay = 0.6 + random.uniform(0.0, 0.4)
             try:
+                with self._lock:
+                    self._requests[endpoint] += 1
                 with opener.open(request, timeout=min(remaining, timeout)) as response:
-                    data = json.loads(response.read(12_000_001))
+                    body = response.read(12_000_001)
+                if len(body) > 12_000_000:
+                    raise ValueError("Превышен размер ответа")
+                data = json.loads(body)
                 if not isinstance(data, dict):
                     raise ValueError("Ожидался JSON-объект")
                 return data
             except HTTPError as exc:
+                if exc.code == 429 and (hint := exc.headers.get("Retry-After", "")).isdigit():
+                    delay = min(4.0, max(delay, float(hint)))
                 exc.close()
                 error = GatewayError(endpoint, exc.code)
                 transient = exc.code in {408, 429} or 500 <= exc.code <= 599
-            except (URLError, TimeoutError, OSError, ValueError):
-                error = GatewayError(endpoint)
+            except (URLError, TimeoutError, OSError):
+                error = GatewayError(endpoint, reason="network_error")
                 transient = True
-            if attempt or not retry or not transient or deadline - time.monotonic() < 1.5:
+            except (ValueError, RecursionError):
+                error = GatewayError(endpoint)
+                transient = False
+            if attempt or not retry or not transient or deadline - time.monotonic() < delay + 1.0:
                 raise error
-            time.sleep(0.65)
+            time.sleep(delay)
         raise GatewayError(endpoint)
 
     def embeddings(self, texts: list[str], deadline: float) -> list[list[float]]:
@@ -147,7 +178,7 @@ class Gateway:
                     raise ValueError("Некорректный вектор")
                 vectors.append([number / norm for number in vec])
             return vectors
-        except (KeyError, ValueError, TypeError, OverflowError) as exc:
+        except (IndexError, KeyError, ValueError, TypeError, OverflowError) as exc:
             raise GatewayError(endpoint) from exc
 
     def rerank(self, query: str, documents: list[str], deadline: float) -> list[int]:
@@ -176,23 +207,66 @@ class Gateway:
             "temperature": 0.0 if verify else self.settings.temperature,
             "max_tokens": self.settings.max_tokens,
         }
-        if self.settings.json_mode:
+        with self._lock:
+            unsupported = self._unsupported.copy()
+        if self.settings.json_mode and "response_format" not in unsupported:
             payload["response_format"] = {"type": "json_object"}
+        thinking = self.settings.thinking
+        if thinking in {"on", "off"} and "thinking" not in unsupported:
+            payload["thinking"] = {"type": "enabled" if thinking == "on" else "disabled"}
+
+        with span("proxy.verify" if verify else "proxy.generate", kind="LLM") as trace:
+            try:
+                data = self._chat_post(payload, deadline)
+                return self._content(data)
+            except GatewayError as exc:
+                if exc.reason not in {"empty", "truncated", "invalid_json"} or deadline - time.monotonic() < 5:
+                    trace.set("psb.gateway.failure", exc.reason)
+                    raise
+                trace.set("psb.gateway.repair", exc.reason)
+            # No model draft or hidden reasoning is carried into the repair request.
+            if thinking == "auto" and "thinking" not in unsupported:
+                payload["thinking"] = {"type": "disabled"}
+            payload["messages"][0]["content"] += "\nВерни короткий законченный JSON. Не добавляй комментарии вне JSON."
+            return self._content(self._chat_post(payload, deadline, retry=False))
+
+    def _chat_post(self, payload: dict, deadline: float, *, retry: bool = True) -> dict:
+        endpoint = "/chat/completions"
+        with self._lock:
+            payload = {name: value for name, value in payload.items() if name not in self._unsupported}
         try:
-            data = self._post(endpoint, self.settings.key, payload, deadline, 42.0, retry=True)
+            return self._post(endpoint, self.settings.key, payload, deadline, 38.0, retry=retry)
         except GatewayError as exc:
-            if "response_format" not in payload or exc.status not in {400, 422}:
+            optional = set(payload) & {"thinking", "response_format"}
+            if not optional or exc.status not in {400, 422}:
                 raise
-            del payload["response_format"]
-            data = self._post(endpoint, self.settings.key, payload, deadline, 42.0)
+            compatible = {key: value for key, value in payload.items() if key not in optional}
+            data = self._post(endpoint, self.settings.key, compatible, deadline, 38.0)
+            with self._lock:
+                self._unsupported.update(optional)
+            return data
+
+    @staticmethod
+    def _content(data: dict) -> dict:
+        endpoint = "/chat/completions"
         try:
-            content = data["choices"][0]["message"]["content"].strip()
-            if content.startswith("```") and content.endswith("```"):
-                _, _, content = content.partition("\n")
-                content = content[:-3].strip()
-            result = json.loads(content)
-            if not isinstance(result, dict):
-                raise ValueError("Ожидался JSON-объект")
-            return result
-        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
+            choice = data["choices"][0]
+            finish = choice.get("finish_reason")
+            content = choice["message"].get("content")
+        except (AttributeError, IndexError, KeyError, TypeError) as exc:
             raise GatewayError(endpoint) from exc
+        if finish == "content_filter":
+            raise GatewayError(endpoint, reason="content_filter")
+        if not isinstance(content, str) or not content.strip():
+            raise GatewayError(endpoint, reason="truncated" if finish == "length" else "empty")
+        content = content.lstrip("\ufeff \r\n\t")
+        if match := re.fullmatch(r"```(?:json)?\s*(.*?)\s*```\s*", content, re.I | re.S):
+            content = match[1]
+        try:
+            result = json.loads(content)
+        except (ValueError, RecursionError) as exc:
+            reason = "truncated" if finish == "length" else "invalid_json"
+            raise GatewayError(endpoint, reason=reason) from exc
+        if not isinstance(result, dict):
+            raise GatewayError(endpoint, reason="invalid_json")
+        return result

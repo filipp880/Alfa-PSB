@@ -28,6 +28,13 @@ const answerStatuses = {
   offline: "Локальный поиск",
 };
 
+const editionStatuses = {
+  applicable: "Действует на запрошенную дату",
+  inapplicable: "За пределами срока действия",
+  unknown: "Применимость не подтверждена",
+  comparison: "Редакция для сравнения",
+};
+
 let turns = [];
 let activeRequest = null;
 let failedTurn = null;
@@ -80,7 +87,38 @@ function questionPayload(question) {
   return history;
 }
 
-function addSources(body, citations) {
+function displayDate(iso) {
+  const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  return parts ? `${parts[3]}.${parts[2]}.${parts[1]}` : "";
+}
+
+function dateBadge(label, iso) {
+  const date = displayDate(iso);
+  if (!date) return null;
+  const badge = node("span", "citation-badge", `${label} `);
+  const time = node("time", "", date);
+  time.dateTime = iso;
+  badge.append(time);
+  return badge;
+}
+
+function addEditionDates(details, citation, hasEventDates) {
+  const badges = node("div", "citation-badges");
+  if ((hasEventDates || citation.applicability === "comparison") && Object.hasOwn(editionStatuses, citation.applicability)) {
+    const badge = node("span", "citation-badge", editionStatuses[citation.applicability]);
+    badge.dataset.applicability = citation.applicability;
+    badges.append(badge);
+  }
+  const dates = [
+    dateBadge("В силе с", citation.effective_from),
+    dateBadge("Утратила силу с", citation.effective_to),
+    dateBadge("Выгрузка от", citation.snapshot_date),
+  ].filter(Boolean);
+  badges.append(...dates);
+  if (badges.childElementCount) details.append(badges);
+}
+
+function addSources(body, citations, hasEventDates) {
   const anchors = new Map();
   if (!citations.length) return anchors;
   const section = node("section", "evidence");
@@ -91,7 +129,9 @@ function addSources(body, citations) {
     const details = node("details", "citation");
     const label = [citation.title, citation.locator].filter(Boolean).join(" · ");
     const summary = node("summary", "", label);
-    details.append(summary, node("blockquote", "", citation.quote));
+    details.append(summary);
+    addEditionDates(details, citation, hasEventDates);
+    details.append(node("blockquote", "", citation.quote));
     const openSource = node("button", "open-source", "Открыть в документе");
     openSource.type = "button";
     openSource.addEventListener("click", () => showDocument(citation.document_id, citation));
@@ -113,7 +153,13 @@ function renderAnswer(body, answer) {
   }
   const text = node("p", "message-text");
   body.append(text);
-  const anchors = addSources(body, answer.citations || []);
+  const dates = (answer.event_ranges || []).map(([start, end]) => {
+    const first = displayDate(start);
+    const last = displayDate(end);
+    return first && last && first !== last ? `${first} – ${last}` : first || last;
+  }).filter(Boolean);
+  if (dates.length) body.append(node("p", "event-dates", `Запрошенные даты · ${dates.join(" · ")}`));
+  const anchors = addSources(body, answer.citations || [], Boolean(dates.length));
   for (const part of answer.text.split(/(\[P\d+\])/g)) {
     const sources = anchors.get(part.slice(1, -1));
     if (!sources) {

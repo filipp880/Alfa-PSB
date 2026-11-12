@@ -1,0 +1,2 @@
+# Optional OpenTelemetry/HTTP exporter for local Phoenix traces.
+opentelemetry-exporter-otlp-proto-http==1.40.0

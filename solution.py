@@ -5,13 +5,16 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import math
 import os
+import statistics
 import tempfile
 import time
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from assistant import TECHNICAL, load_assistant
+from assistant import Answer, TECHNICAL, load_assistant
 from proxy import env
 
 LOG = logging.getLogger(__name__)
@@ -66,7 +69,8 @@ def main() -> None:
     directory = Path(env("DATA_DIR", default="data"))
     questions = read_questions(args.questions or directory / "questions.csv")
     # Leave time to replace the output atomically before the platform timeout.
-    deadline = time.monotonic() + 1130
+    started = time.monotonic()
+    deadline = started + 1130
     answers = [TECHNICAL] * len(questions)
     write_submission(args.output, questions, answers)
     assistant = load_assistant(args.kb or find_kb(directory), deadline=deadline)
@@ -77,10 +81,17 @@ def main() -> None:
     pool = ThreadPoolExecutor(max_workers=assistant.settings.workers)
     pending = {}
     remaining = iter(enumerate(questions))
+    durations = []
+    statuses: Counter[str] = Counter()
+
+    def process(question: str) -> tuple[Answer, float]:
+        before = time.monotonic()
+        answer = assistant.ask(question, deadline=deadline)
+        return answer, time.monotonic() - before
 
     def enqueue() -> None:
         for position, (_, question) in remaining:
-            pending[pool.submit(assistant.ask, question, deadline=deadline)] = position
+            pending[pool.submit(process, question)] = position
             break
 
     try:
@@ -93,9 +104,13 @@ def main() -> None:
             for future in done:
                 position = pending.pop(future)
                 try:
-                    answers[position] = future.result().csv_text() or TECHNICAL
+                    answer, seconds = future.result()
+                    answers[position] = answer.csv_text() or TECHNICAL
+                    statuses[answer.status] += 1
+                    durations.append(seconds)
                 except Exception as exc:
                     LOG.warning("Ошибка обработки строки %d (%s)", position + 1, type(exc).__name__)
+                    statuses["error"] += 1
                 finished += 1
                 since_write += 1
                 if time.monotonic() < deadline:
@@ -108,6 +123,11 @@ def main() -> None:
         pool.shutdown(wait=False, cancel_futures=True)
         write_submission(args.output, questions, answers)
     LOG.info("Создан %s, обработано %d/%d", args.output.name, finished, len(questions))
+    LOG.info("Время %.1f с, статусы %s, запросы %s", time.monotonic() - started,
+             dict(statuses), assistant.gateway.request_counts())
+    if durations:
+        p95 = sorted(durations)[math.ceil(0.95 * len(durations)) - 1]
+        LOG.info("Время обработки вопроса, p50 %.2f с, p95 %.2f с", statistics.median(durations), p95)
 
 
 if __name__ == "__main__":

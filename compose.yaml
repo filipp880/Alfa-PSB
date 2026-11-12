@@ -17,5 +17,7 @@ services:
       TEMPERATURE: "${TEMPERATURE:-0}"
       TOP_K: "${TOP_K:-18}"
       RERANKER_TOP_N: "${RERANKER_TOP_N:-10}"
-      LLM_JSON_MODE: "${LLM_JSON_MODE:-0}"
+      LLM_JSON_MODE: "${LLM_JSON_MODE:-1}"
+      LLM_THINKING: "${LLM_THINKING:-auto}"
+      RAG_RETRY_SEARCH: "${RAG_RETRY_SEARCH:-1}"
       OFFLINE: "${OFFLINE:-0}"

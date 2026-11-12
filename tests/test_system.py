@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,7 +14,7 @@ from unittest.mock import patch
 
 from assistant import LegalAssistant, dialogue
 from corpus import load_corpus
-from proxy import GatewayError, Settings
+from proxy import Gateway, GatewayError, Settings
 
 ROOT = Path(__file__).resolve().parents[1]
 KB = ROOT / "data" / "knowledge-base.zip"
@@ -50,10 +51,10 @@ class FixtureGateway(BaseHTTPRequestHandler):
                 if not matches:
                     self.send_error(400)
                     return
-                evidence = [{"id": matches[0], "quote": RENT_QUOTE}]
+                evidence = [matches[0]]
                 answer = {"status": "answered", "claims": [{"text": AMOUNT, "evidence": evidence},
                     {"text": "Арендная плата составляет 500 000 рублей в месяц.", "evidence": evidence},
-                    {"text": "Пункт выдуман.", "evidence": [{"id": "P999999", "quote": RENT_QUOTE}]}], "gap": ""}
+                    {"text": "Пункт выдуман.", "evidence": ["P999999"]}], "gap": ""}
             else:
                 answer = {"status": "insufficient", "claims": [], "gap": ""}
             result = {"choices": [{"message": {"content": json.dumps(answer, ensure_ascii=False)}}]}
@@ -112,6 +113,70 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(answer.status, "error")
         self.assertNotIn("450 000", answer.text)
         self.assertFalse(answer.citations)
+
+    def test_targeted_search_recovers_a_missing_passage(self):
+        assistant = LegalAssistant(self.corpus, Settings(base_url="http://localhost", key="fixture", model="fixture"))
+        amount = next(p for p in self.corpus.search(RENT, 12) if RENT_QUOTE in p.text)
+        irrelevant = next(p for p in self.corpus.passages.values() if p.document_id == "D21")
+        prompts = []
+
+        def chat(system, payload, deadline, *, verify=False):
+            prompts.append(payload)
+            if verify:
+                return {"supported": [0], "gap_ok": False}
+            if any(p["id"] == amount.id for p in payload["passages"]):
+                return {"status": "answered", "claims": [{"text": AMOUNT, "evidence": [amount.id]}]}
+            return {"status": "insufficient", "claims": [], "look_for": "пункт 3.1 арендная плата"}
+
+        with patch.object(assistant, "retrieve", return_value=[irrelevant]), patch.object(assistant.gateway, "chat", chat):
+            answer = assistant.ask(RENT)
+        self.assertEqual(len(prompts), 3)
+        self.assertEqual(answer.status, "answered")
+        self.assertIn(RENT_QUOTE, answer.citations[0].quote)
+
+    def test_wrong_edition_cannot_be_sole_support(self):
+        question = "Куда везти товар по П-17/2024, если спецификацию подписали 01.10.2024?"
+        assistant = LegalAssistant(self.corpus, Settings())
+        scope = assistant.scope_for(question, [])
+        amendment = next(p for p in self.corpus.passages.values() if p.locator == "изменение п. 3.2")
+        draft = {"claims": [{"text": "Нужен адрес в Химках.", "evidence": [amendment.id]}]}
+        self.assertEqual(self.corpus.applicability(amendment, scope), "inapplicable")
+        self.assertEqual(assistant.validated_claims(draft, {amendment.id: amendment}, scope), [])
+
+    def test_chat_repairs_truncation_and_handles_incompatible_optional_parameters(self):
+        gateway = Gateway(Settings(key="fixture", model="fixture"))
+        payloads = []
+
+        def post(endpoint, key, payload, deadline, timeout, *, retry=False):
+            payloads.append(set(payload))
+            if len(payloads) == 1:
+                raise GatewayError(endpoint, 422)
+            if len(payloads) == 2:
+                return {"choices": [{"finish_reason": "length", "message": {"content": ""}}]}
+            return {"choices": [{"finish_reason": "stop", "message": {"content": '```json\n{"ok":true}\n```'}}]}
+
+        with patch.object(gateway, "_post", post):
+            self.assertEqual(gateway.chat("Верни JSON", {}, time.monotonic() + 20), {"ok": True})
+            self.assertEqual(gateway.chat("Верни JSON", {}, time.monotonic() + 20), {"ok": True})
+        self.assertIn("response_format", payloads[0])
+        self.assertNotIn("response_format", payloads[1])
+        self.assertNotIn("response_format", payloads[2])
+        self.assertIn("thinking", payloads[2])
+        self.assertNotIn("response_format", payloads[3])
+
+    def test_embedding_cache_skips_rebuilding_for_same_corpus_and_model(self):
+        with tempfile.TemporaryDirectory() as cache:
+            settings = Settings(base_url="http://localhost", key="fixture", model="fixture",
+                                embed_model="fixture-bge", embed_cache=cache)
+            first = LegalAssistant(self.corpus, settings)
+            with patch.object(first.gateway, "embeddings", side_effect=lambda texts, deadline: [[1.0, 0.0]] * len(texts)) as build:
+                first.prepare(time.monotonic() + 10)
+            self.assertGreater(build.call_count, 1)
+            second = LegalAssistant(self.corpus, settings)
+            with patch.object(second.gateway, "embeddings") as build:
+                second.prepare(time.monotonic() + 10)
+            build.assert_not_called()
+            self.assertEqual(second.vectors, first.vectors)
 
     def test_csv_against_gateway_fixture(self):
         with ThreadingHTTPServer(("127.0.0.1", 0), FixtureGateway) as server, tempfile.TemporaryDirectory() as directory:

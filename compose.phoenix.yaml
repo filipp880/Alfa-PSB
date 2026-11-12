@@ -1,0 +1,22 @@
+services:
+  assistant:
+    build:
+      context: .
+      args:
+        PSB_INSTALL_TELEMETRY: "1"
+    environment:
+      PSB_TRACE: "1"
+      PSB_TRACE_ENDPOINT: "http://phoenix:6006/v1/traces"
+      PSB_TRACE_PROJECT: "${PSB_TRACE_PROJECT:-alfa-psb}"
+
+  phoenix:
+    image: arizephoenix/phoenix:version-20.14.0@sha256:c0de43c548f3fcd5c5f8fceaaa83fd31bf052d6efaa293c67ddb580f898e297b
+    ports:
+      - "127.0.0.1:6006:6006"
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data
+    volumes:
+      - phoenix-data:/mnt/data
+
+volumes:
+  phoenix-data:

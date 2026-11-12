@@ -160,12 +160,18 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
 .retry:hover { border-color: var(--accent); }
 
 .evidence { margin-top: 17px; padding-top: 12px; border-top: 1px solid var(--line); }
+.event-dates { margin: 11px 0 0; color: var(--muted); font-size: 12px; }
 .evidence > h4 { margin: 0 0 9px; font-size: 13px; }
 .evidence-list { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
 .citation { border: 1px solid var(--line); border-radius: 8px; background: #f9fafc; }
 .citation summary { padding: 8px 11px; cursor: pointer; font-size: 13px; font-weight: 650; }
 .citation summary:hover { color: var(--accent-dark); }
 .citation-ref { padding: 0 2px; border: 0; color: var(--accent-dark); background: transparent; font-size: .86em; font-weight: 680; text-decoration: underline; text-underline-offset: 2px; }
+.citation-badges { display: flex; flex-wrap: wrap; gap: 5px; margin: 0 11px 9px; }
+.citation-badge { padding: 2px 6px; border-radius: 4px; color: #4c596d; background: #e9edf4; font-size: 11px; font-weight: 650; }
+.citation-badge[data-applicability="applicable"] { color: #22573e; background: #dff1e6; }
+.citation-badge[data-applicability="unknown"],
+.citation-badge[data-applicability="inapplicable"] { color: #763214; background: var(--accent-wash); }
 .citation blockquote { margin: 0 13px 8px; padding: 0 0 0 11px; border-left: 2px solid #e29a82; color: #374259; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
 .open-source { margin: 1px 13px 11px; padding: 2px 0; border: 0; color: var(--accent-dark); background: transparent; font-size: 12px; font-weight: 650; text-decoration: underline; text-underline-offset: 3px; }
 

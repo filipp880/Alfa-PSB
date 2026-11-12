@@ -143,6 +143,7 @@ class AssistantHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, {
             "status": answer.status,
             "text": answer.text,
+            "event_ranges": answer.event_ranges,
             "citations": [
                 {
                     "id": citation.id,
@@ -150,6 +151,10 @@ class AssistantHandler(BaseHTTPRequestHandler):
                     "title": citation.title,
                     "locator": citation.locator,
                     "quote": citation.quote,
+                    "effective_from": citation.effective_from,
+                    "effective_to": citation.effective_to,
+                    "snapshot_date": citation.snapshot_date,
+                    "applicability": citation.applicability,
                 }
                 for citation in answer.citations
             ],

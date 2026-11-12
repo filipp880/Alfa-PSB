@@ -5,7 +5,7 @@ __pycache__/
 submission.csv
 questions.csv
 data/demo_*.csv
-dist/*
-!dist/submission.zip
+dist/
+.psb-cache/
 tmp/
 ~$*

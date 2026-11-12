@@ -5,7 +5,8 @@ from __future__ import annotations
 from calendar import monthrange
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
+from difflib import SequenceMatcher
 from io import BytesIO
 from math import log1p
 from pathlib import Path, PurePosixPath
@@ -14,6 +15,12 @@ from typing import Iterator
 import unicodedata
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
+
+try:
+    from rapidfuzz.fuzz import ratio as _name_similarity
+except ImportError:
+    def _name_similarity(left: str, right: str) -> float:
+        return 100.0 * SequenceMatcher(None, left, right, autojunk=False).ratio()
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +49,21 @@ class Passage:
     edition_note: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class SearchScope:
+    """Evidence anchors and event dates extracted without treating them as facts."""
+
+    document_ids: tuple[str, ...] = ()
+    exact_document_ids: tuple[str, ...] = ()
+    candidate_entities: tuple[str, ...] = ()
+    ambiguous_entities: tuple[str, ...] = ()
+    unresolved_references: tuple[str, ...] = ()
+    points: tuple[str, ...] = ()
+    date_ranges: tuple[tuple[date, date], ...] = ()
+    event_role: str = ""
+    comparison: bool = False
+
+
 _MONTHS = "янв фев мар апр ма июн июл авг сен окт ноя дек".split()
 _MONTH_PATTERN = (
     r"январ[ьяе]|феврал[ьяе]|март[ае]?|апрел[ьяе]|ма[йяе]|июн[ьяе]|июл[ьяе]|"
@@ -59,10 +81,25 @@ _WORD = re.compile(r"[а-яa-z]+|\d+(?:[.,]\d+)?")
 _ENTITY = re.compile(r"\b[а-яa-z]+(?:-[а-яa-z]+)+\b")
 _ORG_QUOTE = re.compile(r"[«\"“]([^»\"”\n]{2,80})[»\"”]")
 _ID = re.compile(r"(?<!\w)([а-яa-z]{1,4})-\s*(\d+)(?:[/\-](20\d{2}))?(?!\w)", re.I)
-_ARTICLE = re.compile(r"\b(?:статья|стать[еию]|ст\.)\s*(\d+(?:\.\d+)*)", re.I)
-_POINT = re.compile(r"\b(?:пункт\w*|п\.)\s*(\d+(?:\.\d+)*)", re.I)
+_ARTICLE = re.compile(r"\b(?:стать(?:я|и|е|ю|ей|ями|ях|ям)|ст\.?)\s*(\d+(?:\.\d+)*)", re.I)
+_POINT = re.compile(r"\b(?:пункт\w*|част[ьи]|п\.|ч\.)\s*(\d+(?:\.\d+)*)", re.I)
+_NUMBER_TAIL = re.compile(r"\s*(?:,\s*|\b(?:и|или)\s+)(\d+(?:\.\d+)*)(?![\d./-])", re.I)
+_ARTICLE_FAMILY = re.compile(
+    r"\b(?P<tk>тк(?:\s+рф)?|трудов\w*\s+кодекс\w*)\b|"
+    r"\b(?P<nk>нк(?:\s+рф)?|налогов\w*\s+кодекс\w*)\b|"
+    r"\b(?P<koap>коап(?:\s+рф)?|кодекс\w*\s+(?:рф\s+)?об\s+административных\s+правонарушениях)\b|"
+    r"\b(?P<gk>гк(?:\s+рф)?|гражданск\w*\s+кодекс\w*)\b|"
+    r"\b(?P<uk>ук(?:\s+рф)?|уголовн\w*\s+кодекс\w*)\b|"
+    r"\b(?P<fz>\d{1,4}\s*-?\s*фз)\b", re.I,
+)
+_FAMILY_NAMES = {"tk": "ТК РФ", "nk": "НК РФ", "koap": "КоАП РФ", "gk": "ГК РФ", "uk": "УК РФ"}
+_LEGAL_ENTITY = re.compile(r"\b(?:ооо|ао|пао|зао|оао)\s*[«\"“]([^»\"”\n]{2,80})[»\"”]", re.I)
+_LOCATOR_POINT = re.compile(r"\b(?:п|ч)\.\s*(\d+(?:\.\d+)*(?:-\d+)?)\b", re.I)
+_LOCAL_POINT_LIST = re.compile(r"\bпункт\w*\s+([\d.,\s]+(?:и\s+\d+(?:\.\d+)*)?)\s+настоящей\s+статьи", re.I)
+_AMENDMENT_DATE = re.compile(r"\bспецификаци\w*[^.!?\n]{0,90}?подписан\w*\s+после\s+", re.I)
+_DATE_COMPARISON = re.compile(r"\b(?:сравн\w*|сопостав\w*|раньше\s+и\s+теперь|до\s+и\s+после)\b", re.I)
 _RATE = re.compile(r"\b(\d+(?:[.,]\d+)?)\s*(?:%|процент\w*)", re.I)
-_AMOUNT = re.compile(r"\b(\d{1,3}(?:\s\d{3})+)(?=\s*(?:\(|руб))|\b(\d+)\s*(млн|тыс)\b", re.I)
+_AMOUNT = re.compile(r"\b(\d{1,3}(?:\s\d{3}){1,5})(?=\s*(?:\(|руб))|\b(\d{1,15})\s*(млн|тыс)\b", re.I)
 _LAW_FILE = re.compile(r"^(.+?)_ст(\d+(?:\.\d+)*)", re.I)
 _CLAUSE = re.compile(r"^[«\"]?(\d+(?:\.\d+)+(?:-\d+)?)\.\s+|^(\d+)\.\s+")
 _SUBCLAUSE = re.compile(r"^(\d+(?:\.\d+)*(?:-\d+)?|[а-я])\)\s+", re.I)
@@ -76,11 +113,13 @@ _LAW_CHANGE = re.compile(
 )
 _TRANSITION = re.compile(r"^Положения (?:пункта|части)\s+(\d+(?:\.\d+)*)\s+\(в редакции\b", re.I)
 _DEFAULT_RATE_QUERY = re.compile(r"\b(?:стандартн\w*|основн\w*|общ\w*|базов\w*)\s+ставк\w*", re.I)
+_RATE_QUERY = re.compile(r"\b(?:какая|какова|укажите)\s+ставк\w*\s+(?:ндс\b|налог\w*\s+на\s+прибыл\w*)", re.I)
 _DEFAULT_RATE_PROVISION = re.compile(r"\b(?:если иное не установлено настоящей статьей|в случаях, не указанных в пунктах)\b", re.I)
 _PAYMENT_DEADLINE = re.compile(r"\b(?:срок\w*\s+(?:оплат\w*|расчет\w*)|когда\s+(?:платить|оплатить))\b", re.I)
 _LAW_NOTE = re.compile(
     r"^(?:ГАРАНТ\s*:|Информация об изменениях|См\.|Федеральн\w+ закон\w* от\b|"
-    r"Об изменени\w* |О конституционно-правовом|О проверке конституционности)", re.I,
+    r"Об изменени\w* |О конституционно-правовом|О проверке конституционности|Обратите внимание|"
+    r"[сc]рок давности привлечения к ответственности по ст\.)", re.I,
 )
 _ASSISTANT_COMMAND = re.compile(
     r"^\s*(?:внимание\s+для\s+(?:ии[- ]?)?ассистента\s*:|"
@@ -185,7 +224,7 @@ def _month_number(text: str) -> int:
     return next(index for index, root in enumerate(_MONTHS, 1) if month.startswith(root))
 
 
-def _dates(text: str) -> list[date]:
+def _date_mentions(text: str) -> list[tuple[int, int, date]]:
     values = []
     for match in _DATE.finditer(text):
         try:
@@ -193,19 +232,20 @@ def _dates(text: str) -> list[date]:
                 value = date(int(match["year"]), int(match["month"]), int(match["day"]))
             else:
                 value = date(int(match["text_year"]), _month_number(match["text_month"]), int(match["text_day"]))
-            values.append((match.start(), value))
+            values.append((match.start(), match.end(), value))
         except ValueError:
             continue
     for match in _ISO_DATE.finditer(text):
         try:
-            values.append((match.start(), date(*(int(part) for part in match.groups()))))
+            values.append((match.start(), match.end(), date(*(int(part) for part in match.groups()))))
         except ValueError:
             continue
-    return [value for _, value in sorted(values)]
+    return sorted(values)
 
 
 def _first_date(text: str) -> date | None:
-    return next(iter(_dates(text)), None)
+    mentions = _date_mentions(text)
+    return mentions[0][2] if mentions else None
 
 
 def _date_after(pattern: re.Pattern[str], text: str) -> date | None:
@@ -213,17 +253,108 @@ def _date_after(pattern: re.Pattern[str], text: str) -> date | None:
     return _first_date(text[match.end():]) if match else None
 
 
-def _date_range(text: str) -> tuple[date, date] | None:
-    if value := _first_date(text):
-        return value, value
-    if match := _MONTH_YEAR.search(text):
-        month = _month_number(match[1])
-        year = int(match[2])
-        return date(year, month, 1), date(year, month, monthrange(year, month)[1])
-    if match := _YEAR.search(text):
-        year = int(match[1] or match[2])
-        return date(year, 1, 1), date(year, 12, 31)
-    return None
+def _event_role(text: str, start: int, end: int) -> str:
+    left = text[max(0, start - 75):start]
+    left = re.split(r"[!?;\n]|\.(?=\s)", left)[-1]
+    right = text[end:end + 35]
+    if re.search(r"\bспецификаци\w*\b", left) and re.search(
+        r"\b(?:подпис\w*|заключ\w*|от)\b", left
+    ):
+        return "specification"
+    if re.search(r"\b(?:подпис\w*|заключ\w*)\b", left):
+        if re.search(r"\bдоп(?:олнительное)?\s*соглашени\w*\b", left):
+            return "amendment_signature"
+        return "signature"
+    if re.search(r"\b(?:достав\w*|отгруз\w*|постав\w*)\b[^.!?]{0,28}$", left):
+        return "delivery"
+    if re.search(r"\b(?:договор\w*|регламент\w*|редакци\w*)\s+(?:№\s*[а-яa-z\d/-]+\s+)?от\s*$", left):
+        return "document"
+    if re.match(r"\s*(?:был[аио]?\s+)?подпис\w*\s+спецификаци\w*", right):
+        return "specification"
+    return ""
+
+
+def _event_dates(query: str) -> tuple[tuple[tuple[date, date], ...], str, bool]:
+    text = _normalize(query)
+    mentions = [(start, end, (value, value)) for start, end, value in _date_mentions(text)]
+    for pattern in (_MONTH_YEAR, _YEAR):
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            if any(start < occupied_end and end > occupied_start for occupied_start, occupied_end, _ in mentions):
+                continue
+            if pattern is _MONTH_YEAR:
+                month, year = _month_number(match[1]), int(match[2])
+                period = date(year, month, 1), date(year, month, monthrange(year, month)[1])
+            else:
+                year = int(match[1] or match[2])
+                period = date(year, 1, 1), date(year, 12, 31)
+            mentions.append((start, end, period))
+    dates = []
+    for start, end, period in sorted(mentions):
+        left = text[max(0, start - 20):start]
+        right = text[end:end + 20]
+        qualifier_match = re.search(r"\b(не позднее|не после|начиная с|не ранее|после|до)\s*$", left)
+        qualifier = qualifier_match[1] if qualifier_match else ""
+        if qualifier == "после" and period[1] < date.max:
+            period = period[1] + timedelta(days=1), date.max
+        elif qualifier in {"не позднее", "не после", "до"} and period[0] > date.min:
+            inclusive = qualifier != "до" or bool(re.match(r"\s+включительно\b", right))
+            period = date.min, period[1] if inclusive else period[0] - timedelta(days=1)
+        elif qualifier in {"начиная с", "не ранее"}:
+            period = period[0], date.max
+        dates.append((period, _event_role(text, start, end)))
+    compared = len(dates) > 1 and bool(_DATE_COMPARISON.search(text))
+    if not compared and len(dates) > 1:
+        actual = [item for item in dates if item[1] != "document"]
+        if actual:
+            dates = actual
+        desired_role = next((role for marker, role in (
+            (r"на\s+дату\s+подписания\s+спецификаци\w*", "specification"),
+            (r"на\s+дату\s+подписания\s+доп(?:олнительного)?\s*соглашени\w*", "amendment_signature"),
+            (r"на\s+дату\s+(?:отгрузки|поставки|доставки)", "delivery"),
+            (r"на\s+дату\s+(?:подписания|заключения)\s+договора", "signature"),
+        ) if re.search(marker, text)), "")
+        selected = [item for item in dates if item[1] == desired_role] if desired_role else []
+        if len(selected) == 1:
+            dates = selected
+    periods = tuple(dict.fromkeys(period for period, _ in dates))
+    roles = {role for _, role in dates}
+    return periods, next(iter(roles)) if len(roles) == 1 else "", compared or len(periods) > 1
+
+
+def _number_groups(pattern: re.Pattern[str], text: str) -> Iterator[tuple[str, int, int]]:
+    for match in pattern.finditer(text):
+        end = match.end()
+        yield match[1], match.start(), end
+        while tail := _NUMBER_TAIL.match(text, end):
+            end = tail.end()
+            yield tail[1], tail.start(), end
+
+
+def _family(match: re.Match[str]) -> str:
+    return re.sub(r"[^\d]", "", match[0]) + "фз" if match.lastgroup == "fz" else str(match.lastgroup)
+
+
+def _family_near(text: str, start: int, end: int) -> str:
+    matches = []
+    for match in _ARTICLE_FAMILY.finditer(text):
+        left, right = min(end, match.end()), max(start, match.start())
+        gap = text[left:right]
+        if right - left > 48 or re.search(r"[;!?\n]", gap) or _ARTICLE.search(gap):
+            continue
+        if match.end() <= start and re.fullmatch(r"\s*[,\s]*(?:и|или|а)\s*", gap):
+            continue
+        direct = not gap.strip() or (match.start() >= end and re.fullmatch(r"\s*федеральн\w*\s+закон\w*\s+", gap))
+        matches.append((0 if direct else max(0, right - left), match))
+    return _family(min(matches, key=lambda item: item[0])[1]) if matches else ""
+
+
+def _org_key(text: str) -> str:
+    return " ".join(_WORD.findall(_normalize(text)))
+
+
+def _org_stem(text: str) -> tuple[str, ...]:
+    return tuple(_stem(term) for term in text.split())
 
 
 def _decode_filename(name: str, flags: int) -> str:
@@ -350,6 +481,7 @@ def _law_parts(document: Document) -> Iterator[tuple[str, str, str, date | None,
     unscoped_edition = []
     parent = ""
     part_label = "ч." if re.search(r"\bКоАП\b|\b152-ФЗ\b", document.title) else "п."
+    note_section = False
     for line in lines:
         if line.startswith(("Источник:", "URL:", "Дата выгрузки:")):
             continue
@@ -372,6 +504,10 @@ def _law_parts(document: Document) -> Iterator[tuple[str, str, str, date | None,
                 continue
         if _LAW_NOTE.match(line):
             continue
+        if re.fullmatch(r"Примечани[ея]\s*[.:]?", line, re.I):
+            parent = ""
+            note_section = True
+            continue
         if article_heading.match(line):
             line = article_heading.sub("", line, count=1).lstrip(". ")
             if not line or len(line) < 125 and not re.search(r"\b(?:установить|устанавливается)\b", line, re.I):
@@ -380,7 +516,7 @@ def _law_parts(document: Document) -> Iterator[tuple[str, str, str, date | None,
         subpoint = ""
         if match := _CLAUSE.match(line):
             scope = parent = match[1] or match[2]
-            locator = f"{article_label}, {part_label} {parent}"
+            locator = f"{article_label}, примечание {parent}" if note_section else f"{article_label}, {part_label} {parent}"
         elif match := _SUBCLAUSE.match(line):
             subpoint = match[1]
             locator = f"{article_label}, {part_label} {parent}, подп. {subpoint}" if parent else f"{article_label}, п. {subpoint}"
@@ -391,8 +527,10 @@ def _law_parts(document: Document) -> Iterator[tuple[str, str, str, date | None,
                 locator = f"{article_label}, примечание о применении {part_label} {scope}"
             else:
                 prefix = f"{article_label}, {part_label} {parent}" if parent else article_label
+                if note_section and parent:
+                    prefix = f"{article_label}, примечание {parent}"
                 locator = f"{prefix}, абзац «{_lead(line)}»"
-        notes = article_edition + scoped_edition.get(scope, []) + unscoped_edition
+        notes = article_edition + ([] if note_section else scoped_edition.get(scope, [])) + unscoped_edition
         if subpoint:
             notes += scoped_edition.get(f"{scope}/{subpoint}", [])
         eligible = [value for value, _ in notes if not document.snapshot_date or value <= document.snapshot_date]
@@ -427,6 +565,175 @@ class Corpus:
         self._by_document = defaultdict(list)
         for passage in passages.values():
             self._by_document[passage.document_id].append(passage)
+        self._references = defaultdict(list)
+        self._articles = defaultdict(list)
+        self._article_families = {}
+        self._organizations = defaultdict(list)
+        self._org_names = {}
+        for doc in documents.values():
+            if doc.reference:
+                self._references[doc.reference].append(doc.id)
+                short = doc.reference.split("/", 1)[0]
+                if short != doc.reference:
+                    self._references[short].append(doc.id)
+            if doc.kind == "law" and (number := _ARTICLE.search(doc.title)):
+                normalized_title = _normalize(doc.title)
+                families = {_family(match) for match in _ARTICLE_FAMILY.finditer(normalized_title)}
+                family = next(iter(families)) if len(families) == 1 else _family_near(normalized_title, *number.span())
+                if family:
+                    self._article_families[doc.id] = family
+                    self._articles[family, number[1]].append(doc.id)
+                self._articles["", number[1]].append(doc.id)
+            if doc.kind == "corporate":
+                title = _org_key(doc.title)
+                for name in _LEGAL_ENTITY.findall(doc.text[:1800]):
+                    org = _org_key(name)
+                    if re.search(rf"(?<!\w){re.escape(org)}(?!\w)", title):
+                        self._organizations[org].append(doc.id)
+                        self._org_names[org] = name
+        self._by_position = {passage.id: position for items in self._by_document.values()
+                             for position, passage in enumerate(items)}
+        self._list_members = {}
+        self._list_leads = {}
+        for items in self._by_document.values():
+            for position, lead in enumerate(items):
+                if not lead.text.endswith(":"):
+                    continue
+                lead_section = _LOCATOR_POINT.search(lead.locator)
+                members, size = [], 0
+                for candidate in items[position + 1:position + 13]:
+                    section = _LOCATOR_POINT.search(candidate.locator)
+                    if (lead_section and (not section or section[1] != lead_section[1])) or (
+                        lead.heading and candidate.heading != lead.heading
+                    ) or size + len(candidate.text) > 4200:
+                        break
+                    members.append(candidate)
+                    size += len(candidate.text)
+                    if not candidate.text.endswith(";"):
+                        break
+                if len(members) >= 2 and members[0].text.endswith(";"):
+                    self._list_members[lead.id] = members
+                    for member in members:
+                        self._list_leads.setdefault(member.id, lead)
+        self._sections = defaultdict(list)
+        self._amendments = defaultdict(list)
+        self._amendment_dates = {}
+        for passage in passages.values():
+            point = _LOCATOR_POINT.search(passage.locator)
+            if point:
+                self._sections[passage.document_id, point[1]].append(passage)
+            if point and passage.locator.startswith("изменение"):
+                if boundary := _date_after(_AMENDMENT_DATE, passage.text):
+                    self._amendment_dates[passage.id] = boundary
+                    doc = self.documents[passage.document_id]
+                    self._amendments[doc.reference, point[1]].append(boundary)
+
+    def _organization_matches(self, query: str) -> tuple[set[str], set[str], set[str]]:
+        query_words = _org_key(query).split()
+        words = tuple(_stem(word) for word in query_words)
+        exact, typo, ambiguous = set(), set(), set()
+        for org in self._organizations:
+            tokens = _org_stem(org)
+            if any(words[start:start + len(tokens)] == tokens for start in range(len(words) - len(tokens) + 1)):
+                exact.add(org)
+        candidates = {_org_key(name) for name in (*_ORG_QUOTE.findall(query), *_ENTITY.findall(query))}
+        if not exact:
+            for org in self._organizations:
+                first, *rest = _org_stem(org)
+                for start, word in enumerate(words):
+                    if word == first and rest:
+                        phrase = " ".join(query_words[start:start + len(rest) + 1])
+                        if _name_similarity(phrase, org) >= 86:
+                            candidates.add(phrase)
+            covered = {_org_stem(name)[0] for name in candidates if " " in name}
+            candidates.update(word for word in query_words if len(word) >= 4 and _stem(word) not in covered
+                              and sum(_org_stem(org)[0] == _stem(word) for org in self._organizations) > 1)
+        for candidate in sorted(candidates):
+            if len(candidate) < 4 or any(_org_stem(candidate) == _org_stem(org) for org in exact):
+                continue
+            prefix = {org for org in self._organizations if org.startswith(candidate)
+                      or (" " not in candidate and _org_stem(org)[0] == _stem(candidate))}
+            if len(prefix) > 1:
+                if not prefix & exact:
+                    ambiguous.update(prefix)
+                continue
+            ranked = sorted(((_name_similarity(candidate, org), org) for org in self._organizations), reverse=True)
+            if not ranked or ranked[0][0] < 86:
+                continue
+            score, org = ranked[0]
+            close = {name for similarity, name in ranked if score - similarity < 6 and similarity >= 82}
+            if len(close) > 1:
+                if not close & exact:
+                    ambiguous.update(close)
+            else:
+                typo.add(org)
+        return exact, typo - exact, ambiguous - exact
+
+    def scope(self, query: str) -> SearchScope:
+        normalized = _normalize(query)
+        exact_docs, inferred_docs, ref_docs, unresolved = [], [], [], []
+        for match in _ID.finditer(normalized):
+            reference = _reference(match)
+            if ids := self._references.get(reference):
+                ref_docs.extend(ids)
+            elif match[3] or re.search(r"(?:№\s*|договор\w*\s+)$", normalized[max(0, match.start() - 22):match.start()]):
+                unresolved.append(reference)
+        exact_docs.extend(ref_docs)
+        for number, start, end in _number_groups(_ARTICLE, normalized):
+            family = _family_near(normalized, start, end)
+            if ids := self._articles.get((family, number)):
+                (exact_docs if family or len(ids) == 1 else inferred_docs).extend(ids)
+            else:
+                display_family = _FAMILY_NAMES.get(family, f"{family[:-2]}-ФЗ" if family.endswith("фз") else "")
+                unresolved.append(f"ст. {number}" + (f" ({display_family})" if display_family else ""))
+
+        exact_org, typo_org, ambiguous_org = self._organization_matches(normalized)
+        if ref_docs and ambiguous_org:
+            matching = {name for name in ambiguous_org if set(self._organizations[name]) & set(ref_docs)}
+            if len(matching) == 1:
+                ambiguous_org.clear()
+                exact_org.update(matching)
+        exact_docs.extend(doc_id for org in sorted(exact_org) for doc_id in self._organizations[org])
+        inferred_docs.extend(doc_id for org in sorted(typo_org | ambiguous_org) for doc_id in self._organizations[org])
+        ranges, role, comparison = _event_dates(query)
+        return SearchScope(
+            document_ids=tuple(dict.fromkeys(exact_docs + inferred_docs)),
+            exact_document_ids=tuple(dict.fromkeys(exact_docs)),
+            candidate_entities=tuple(self._org_names[org] for org in sorted(exact_org | typo_org | ambiguous_org)),
+            ambiguous_entities=tuple(self._org_names[org] for org in sorted(ambiguous_org)),
+            unresolved_references=tuple(dict.fromkeys(unresolved)),
+            points=tuple(dict.fromkeys(number for number, _, _ in _number_groups(_POINT, normalized))),
+            date_ranges=ranges, event_role=role, comparison=comparison,
+        )
+
+    def applicability(self, passage: Passage, scope: SearchScope) -> str:
+        """Assess whether the corpus has an explicit temporal boundary for this evidence."""
+        if scope.comparison:
+            return "comparison"
+        if len(scope.date_ranges) != 1 or scope.event_role == "document":
+            return "unknown"
+        start, end = scope.date_ranges[0]
+        document = self.documents[passage.document_id]
+        if scope.event_role == "specification":
+            if boundary := self._amendment_dates.get(passage.id):
+                return "inapplicable" if end <= boundary else "applicable" if start > boundary else "unknown"
+            point = _LOCATOR_POINT.search(passage.locator)
+            if point and (amendments := self._amendments.get((document.reference, point[1]))):
+                return "inapplicable" if start > min(amendments) else "applicable" if end <= min(amendments) else "unknown"
+        effective = passage.effective_from or document.effective_from
+        expires = document.effective_to
+        if (effective and end < effective) or (expires and start >= expires):
+            return "inapplicable"
+        if (effective and start < effective) or (expires and end >= expires):
+            return "unknown"
+        if document.snapshot_date and end > document.snapshot_date:
+            return "unknown"
+        return "applicable" if effective or expires else "unknown"
+
+    def _section_start(self, doc_id: str, number: str) -> list[Passage]:
+        section = self._sections.get((doc_id, number), [])
+        start = next((item for item in section if "примечание о применении" not in item.locator), None)
+        return [start] if start else []
 
     def context_text(self, passage: Passage) -> str:
         document = self.documents[passage.document_id]
@@ -438,23 +745,62 @@ class Corpus:
             metadata.append(f"Указанная дата действия редакции или изменения {effective:%d.%m.%Y}.")
         if document.effective_to:
             metadata.append(f"Редакция утратила силу с {document.effective_to:%d.%m.%Y}.")
+        if boundary := self._amendment_dates.get(passage.id):
+            metadata.append(f"Изменённое положение применяется к спецификациям, подписанным после {boundary:%d.%m.%Y}.")
         if document.edition_note:
             metadata.append(document.edition_note)
         if passage.edition_note:
             metadata.append(f"Примечания об изменениях из выгрузки (не текст нормы): {passage.edition_note}")
+        if lead := self._list_leads.get(passage.id):
+            metadata.append(f"Вводный абзац перечня {lead.locator}: {lead.text}")
         return "\n".join(filter(None, (*metadata, passage.text)))
+
+    def neighbors(self, passage: Passage) -> list[Passage]:
+        """Return the clause opener and close neighbors within the same section."""
+        items = self._by_document[passage.document_id]
+        position = self._by_position[passage.id]
+        point = _LOCATOR_POINT.search(passage.locator)
+        section = self._sections.get((passage.document_id, point[1]), []) if point else []
+        lead = self._list_leads.get(passage.id)
+        related = [lead] if lead else []
+        if point:
+            related.extend(item for item in self._section_start(passage.document_id, point[1])
+                           if item != passage and item != lead)
+        for candidate in items[max(0, position - 1):position + 2]:
+            if candidate == passage or candidate in related:
+                continue
+            same_heading = passage.heading and passage.heading == candidate.heading and passage.heading != "Преамбула"
+            if same_heading or candidate in section or (not point and passage.locator.startswith("ст.")):
+                related.append(candidate)
+        return related
+
+    def list_context(self, passage: Passage) -> list[Passage]:
+        """Expand a list opener into its consecutive, separately citable items."""
+        return list(self._list_members.get(passage.id, ()))
 
     def related(self, passage: Passage) -> list[Passage]:
         document = self.documents[passage.document_id]
-        if document.kind == "law":
-            if re.search(r"(?:п|ч)\.\s*\d", passage.locator):
-                return [candidate for candidate in self._by_document[document.id]
-                        if candidate.locator.startswith("ст.") and candidate != passage
-                        and (candidate.locator.replace("примечание о применении ", "") == passage.locator
-                             or passage.locator.replace("примечание о применении ", "") == candidate.locator)]
-            return []
-        clause = re.search(r"\bп\.\s*(\d+(?:\.\d+)+)", passage.locator)
         result = []
+        if document.kind == "law":
+            if point := _LOCATOR_POINT.search(passage.locator):
+                result.extend(candidate for candidate in self._sections[document.id, point[1]]
+                              if candidate.locator.replace("примечание о применении ", "") == passage.locator
+                              or passage.locator.replace("примечание о применении ", "") == candidate.locator)
+            for match in _LOCAL_POINT_LIST.finditer(passage.text):
+                for number in re.findall(r"\d+(?:\.\d+)*", match[1]):
+                    result.extend(self._section_start(document.id, number))
+            normalized = _normalize(passage.text)
+            for number, start, end in _number_groups(_ARTICLE, normalized):
+                family = _family_near(normalized, start, end) or self._article_families.get(document.id, "")
+                point_ref = re.search(r"\b(?:пункт\w*|част\w*|п\.|ч\.)\s*(\d+(?:\.\d+)*)\s*$",
+                                      normalized[max(0, start - 36):start])
+                for doc_id in self._articles.get((family, number), []):
+                    if doc_id != document.id:
+                        result.extend(self._section_start(doc_id, point_ref[1]) if point_ref else self._by_document[doc_id][:2])
+            return [item for item in dict.fromkeys(result) if item != passage][:8]
+        clause = _LOCATOR_POINT.search(passage.locator)
+        for number, _, _ in _number_groups(_POINT, _normalize(passage.text)):
+            result.extend(self._section_start(document.id, number))
         for other in self.documents.values():
             if other.id == document.id or other.kind != "corporate":
                 continue
@@ -478,36 +824,37 @@ class Corpus:
                 elif other.edition_note and "в дополнение к порядку" in passage.text.lower():
                     if re.search(rf"(?<!\w){re.escape(candidate.locator)}(?![.\d])", passage.text):
                         result.append(candidate)
-        return list(dict.fromkeys(result))
+        return [item for item in dict.fromkeys(result) if item != passage][:8]
 
-    def search(self, query: str, limit: int = 24) -> list[Passage]:
+    def search(self, query: str, limit: int = 24, *, scope: SearchScope | None = None) -> list[Passage]:
         terms = _query_terms(query)
-        if not terms or limit <= 0:
+        if limit <= 0:
             return []
-        query_date = _date_range(query)
+        scope = scope if scope is not None else self.scope(query)
+        if not terms and not scope.document_ids:
+            return []
         normalized = _normalize(query)
         default_rate = _DEFAULT_RATE_QUERY.search(normalized)
+        generic_rate = _RATE_QUERY.search(normalized)
         payment_deadline = _PAYMENT_DEADLINE.search(normalized)
         entities = tuple(_ORG_QUOTE.findall(normalized))
         query_entities = {token for token in terms if token.startswith(("entity:", "ref:", "article:"))}
+        exact_ids = set(scope.exact_document_ids)
+        scope_ids = set(scope.document_ids)
         document_scores = {}
         for key, document in self.documents.items():
             title = self._titles[key]
             overlap = sum(min(4.0, self._idf.get(token, 3.0)) * weight
                           for token, weight in terms.items() if token in title)
-            exact = len(query_entities & title.keys()) * 4.0
+            overlaps = query_entities & title.keys()
+            if scope.unresolved_references and key not in scope_ids:
+                overlaps = {token for token in overlaps if not token.startswith(("article:", "ref:"))}
+            exact = len(overlaps) * 4.0
             document_title = _normalize(document.title)
             exact += 4.0 * sum(bool(re.search(rf"(?<!\w){re.escape(entity)}(?!\w)", document_title))
                                for entity in entities)
-            factor = 1.0
-            if document.effective_to and not query_date:
-                factor = 0.65
-            if query_date and (document.effective_from or document.effective_to):
-                start, end = query_date
-                incompatible = ((document.effective_from and end < document.effective_from)
-                                or (document.effective_to and start >= document.effective_to))
-                factor = 0.58 if incompatible else 1.25
-            document_scores[key] = (min(12.0, overlap * 0.67) + exact, factor)
+            anchor_bonus = 7.0 if key in exact_ids else 4.5 if key in scope_ids else 0.0
+            document_scores[key] = min(12.0, overlap * 0.67) + exact + anchor_bonus
 
         scores = []
         for key, passage in self.passages.items():
@@ -524,19 +871,42 @@ class Corpus:
                     score += 0.46 * weight * min(4.0, self._idf.get(token, 3.0))
             if passage.locator == "преамбула" or passage.heading == "Реквизиты и подписи сторон":
                 score *= 0.55
-            if default_rate and _DEFAULT_RATE_PROVISION.search(_normalize(passage.text)):
-                score += 9.0
+            if (default_rate or generic_rate) and _DEFAULT_RATE_PROVISION.search(_normalize(passage.text)):
+                score += 9.0 if default_rate else 6.0
             if payment_deadline and self.documents[passage.document_id].kind == "corporate":
                 text = _normalize(passage.text)
                 if re.search(r"\b(?:оплачива\w*|оплат\w*|внос\w*)\b", text) and re.search(
                     r"\b(?:в течение|не позднее|ежемесячно)\b", text
                 ):
                     score += 5.0
-            title_score, factor = document_scores[passage.document_id]
+            document = self.documents[passage.document_id]
+            title_score = document_scores[passage.document_id]
+            if scope.points and (not scope_ids or passage.document_id in scope_ids):
+                point = _LOCATOR_POINT.search(passage.locator)
+                if point and point[1] in scope.points:
+                    score += 18.0 if passage in self._section_start(passage.document_id, point[1]) else 10.0
+            factor = 0.65 if document.effective_to and not scope.date_ranges and not scope.comparison else 1.0
+            if document.kind == "corporate" and scope.date_ranges:
+                temporal = self.applicability(passage, scope)
+                factor = {"inapplicable": 0.58, "applicable": 1.25}.get(temporal, 1.0)
             if score > 0.0 or title_score >= 4.0:
                 scores.append(((score + title_score) * factor, key))
         scores.sort(key=lambda item: -item[0])
-        return [self.passages[key] for _, key in scores[:limit]]
+        ranked = [self.passages[key] for _, key in scores]
+        if not scope_ids:
+            return ranked[:limit]
+        anchored = [item for item in ranked if item.document_id in scope_ids]
+        outside = [item for item in ranked if item.document_id not in scope_ids]
+        # Start with the strongest exact hit and keep candidates from each explicit source.
+        best = anchored[:1]
+        if len(scope_ids) > 1 and limit >= 4:
+            by_document = {}
+            for item in anchored:
+                by_document.setdefault(item.document_id, item)
+            best.extend(list(by_document.values())[:max(2, limit // 4)])
+        reserve = min(len(outside), limit // 4)
+        preferred = list(dict.fromkeys(best + anchored))[:limit - reserve]
+        return (preferred + outside + [item for item in anchored if item not in preferred])[:limit]
 
 
 def load_corpus(path: Path) -> Corpus:

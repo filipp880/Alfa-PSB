@@ -51,10 +51,12 @@ python solution.py --questions /path/to/demo_questions.csv
 
 ### Сравнение сабмитов
 
+Лучший результат на платформе у № 3. Сравнивайте с ним качество ответов № 5. № 4 используйте для диагностики изменений, на которых основан кандидат. [Результаты платформы](submissions/README.md)
+
 ```sh
-python evaluate.py --baseline submissions/4.zip --candidate submissions/5.zip --details
-python evaluate.py --baseline submissions/4.zip --candidate submissions/5.zip --cases eval/holdout.json --details
-python evaluate.py --baseline submissions/4.zip --candidate submissions/5.zip --cases eval/reserve5.json --details
+python evaluate.py --baseline submissions/3.zip --candidate submissions/5.zip --details
+python evaluate.py --baseline submissions/3.zip --candidate submissions/5.zip --cases eval/holdout.json --details
+python evaluate.py --baseline submissions/3.zip --candidate submissions/5.zip --cases eval/reserve5.json --details
 ```
 
 Набор в `eval/cases.json` размечен по предоставленной базе. Скрипт считает полноту поиска в первых 5 и 10 результатах и наличие всех нужных фрагментов в контексте. `--live` дополнительно проверяет статус ответа, шаблоны ожидаемых фактов и дословность цитат по ID. Отчёт показывает технические ошибки, неожиданные отказы и уточнения, вызовы API, p50 и p95, а также стоимость повтора в запросах и число восстановленных ответов по разметке. `--json` сохраняет эти показатели в структурированном выводе. Итоговый балл вычисляет судья организаторов.

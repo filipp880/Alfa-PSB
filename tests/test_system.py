@@ -114,6 +114,56 @@ class SystemTests(unittest.TestCase):
         self.assertNotIn("450 000", answer.text)
         self.assertFalse(answer.citations)
 
+    def test_mistyped_quote_is_replaced_by_verbatim_verified_passage(self):
+        assistant = LegalAssistant(self.corpus, Settings(base_url="http://localhost", key="fixture", model="fixture"))
+        passage = next(p for p in self.corpus.search(RENT, 12) if RENT_QUOTE in p.text)
+        draft = {"status": "answered", "claims": [{"text": AMOUNT,
+                 "evidence": [{"id": passage.id, "quote": "Арендная плата составляет 450.000 рублей в месяц."}]}]}
+        review = {"supported": [0], "gap_ok": False}
+        with patch.object(assistant.gateway, "chat", side_effect=[draft, review]) as chat:
+            answer = assistant.ask(RENT)
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(answer.status, "answered")
+        self.assertEqual([(c.id, c.quote) for c in answer.citations], [(passage.id, passage.text)])
+
+    def test_empty_answered_draft_is_technical_failure(self):
+        assistant = LegalAssistant(self.corpus, Settings(base_url="http://localhost", key="fixture", model="fixture"))
+        with patch.object(assistant.gateway, "chat", return_value={"status": "answered", "claims": []}):
+            answer = assistant.ask(RENT)
+        self.assertEqual(answer.status, "error")
+        self.assertFalse(answer.citations)
+
+    def test_verifier_sees_exception_and_keeps_confirmed_part(self):
+        question = ("Можно ли в 2026 году нанять человека на заведомо временные работы на 45 дней "
+                    "и установить ему испытание на неделю?")
+        assistant = LegalAssistant(self.corpus, Settings(base_url="http://localhost", key="fixture", model="fixture"))
+        term = next(p for p in self.corpus.passages.values()
+                    if "на время выполнения временных (до двух месяцев) работ" in p.text)
+        general = next(p for p in self.corpus.passages.values()
+                       if "от двух до шести месяцев испытание" in p.text)
+        exception = next(p for p in self.corpus.passages.values()
+                         if "лиц, заключающих трудовой договор на срок до двух месяцев;" in p.text)
+        draft = {"status": "answered", "claims": [
+            {"text": "Допускается срочный договор на 45 дней для временных работ.", "evidence": [term.id]},
+            {"text": "Можно установить испытание на неделю.", "evidence": [general.id]},
+        ]}
+        draft_ids = set()
+
+        def chat(system, payload, deadline, *, verify=False):
+            ids = {p["id"] for p in payload["passages"]}
+            if not verify:
+                draft_ids.update(ids)
+                self.assertIn(exception.id, draft_ids)
+                return draft
+            self.assertEqual(ids, draft_ids)
+            return {"supported": [0], "gap_ok": False}
+
+        with patch.object(assistant.gateway, "chat", chat):
+            answer = assistant.ask(question)
+        self.assertEqual(answer.status, "partial")
+        self.assertEqual([citation.id for citation in answer.citations], [term.id])
+        self.assertNotIn("испытание на неделю", answer.text)
+
     def test_targeted_search_recovers_a_missing_passage(self):
         assistant = LegalAssistant(self.corpus, Settings(base_url="http://localhost", key="fixture", model="fixture"))
         amount = next(p for p in self.corpus.search(RENT, 12) if RENT_QUOTE in p.text)

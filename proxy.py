@@ -11,6 +11,7 @@ import re
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from http.client import IncompleteRead
 from threading import Lock
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -135,6 +136,9 @@ class Gateway:
                     self._requests[endpoint] += 1
                 with opener.open(request, timeout=min(remaining, timeout)) as response:
                     body = response.read(12_000_001)
+                    # A bounded read can return early without raising on a short Content-Length body.
+                    if response.length and len(body) <= 12_000_000:
+                        raise IncompleteRead(body, response.length)
                 if len(body) > 12_000_000:
                     raise ValueError("Превышен размер ответа")
                 data = json.loads(body)
@@ -147,7 +151,7 @@ class Gateway:
                 exc.close()
                 error = GatewayError(endpoint, exc.code)
                 transient = exc.code in {408, 429} or 500 <= exc.code <= 599
-            except (URLError, TimeoutError, OSError):
+            except (URLError, TimeoutError, OSError, IncompleteRead):
                 error = GatewayError(endpoint, reason="network_error")
                 transient = True
             except (ValueError, RecursionError):
@@ -220,15 +224,21 @@ class Gateway:
                 data = self._chat_post(payload, deadline)
                 return self._content(data)
             except GatewayError as exc:
-                if exc.reason not in {"empty", "truncated", "invalid_json"} or deadline - time.monotonic() < 5:
+                if exc.reason not in {"empty", "truncated", "invalid_json", "interrupted"} or deadline - time.monotonic() < 5:
                     trace.set("psb.gateway.failure", exc.reason)
                     raise
                 trace.set("psb.gateway.repair", exc.reason)
+                if exc.reason == "truncated":
+                    payload["max_tokens"] = min(8192, 2 * self.settings.max_tokens)
             # No model draft or hidden reasoning is carried into the repair request.
             if thinking == "auto" and "thinking" not in unsupported:
                 payload["thinking"] = {"type": "disabled"}
             payload["messages"][0]["content"] += "\nВерни короткий законченный JSON. Не добавляй комментарии вне JSON."
-            return self._content(self._chat_post(payload, deadline, retry=False))
+            try:
+                return self._content(self._chat_post(payload, deadline, retry=False))
+            except GatewayError as exc:
+                trace.set("psb.gateway.failure", exc.reason)
+                raise
 
     def _chat_post(self, payload: dict, deadline: float, *, retry: bool = True) -> dict:
         endpoint = "/chat/completions"
@@ -252,21 +262,27 @@ class Gateway:
         try:
             choice = data["choices"][0]
             finish = choice.get("finish_reason")
-            content = choice["message"].get("content")
         except (AttributeError, IndexError, KeyError, TypeError) as exc:
             raise GatewayError(endpoint) from exc
+        if finish == "length":
+            raise GatewayError(endpoint, reason="truncated")
+        if finish in ("insufficient_system_resource", "aborted"):
+            raise GatewayError(endpoint, reason="interrupted")
         if finish == "content_filter":
             raise GatewayError(endpoint, reason="content_filter")
+        try:
+            content = choice["message"].get("content")
+        except (AttributeError, KeyError, TypeError) as exc:
+            raise GatewayError(endpoint) from exc
         if not isinstance(content, str) or not content.strip():
-            raise GatewayError(endpoint, reason="truncated" if finish == "length" else "empty")
+            raise GatewayError(endpoint, reason="empty")
         content = content.lstrip("\ufeff \r\n\t")
         if match := re.fullmatch(r"```(?:json)?\s*(.*?)\s*```\s*", content, re.I | re.S):
             content = match[1]
         try:
             result = json.loads(content)
         except (ValueError, RecursionError) as exc:
-            reason = "truncated" if finish == "length" else "invalid_json"
-            raise GatewayError(endpoint, reason=reason) from exc
+            raise GatewayError(endpoint, reason="invalid_json") from exc
         if not isinstance(result, dict):
             raise GatewayError(endpoint, reason="invalid_json")
         return result

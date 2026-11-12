@@ -8,7 +8,8 @@ https://trec.nist.gov/data/reljudge_eng.html
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from collections import Counter
+from contextlib import ExitStack, contextmanager
 import json
 import math
 import os
@@ -25,11 +26,15 @@ from zipfile import BadZipFile, ZipFile
 
 
 ROOT = Path(__file__).resolve().parent
-HYPHENS = str.maketrans("ё−–—‑", "е----")
+HYPHENS = str.maketrans("ё‐‒–—−", "е-----")
+ENDPOINTS = ("/chat/completions", "/embeddings", "/rerank")
+NO_ANSWER_STATUSES = {"refusal", "insufficient", "clarification", "out_of_scope"}
 
 
 def normalized(text: str) -> str:
-    return " ".join(unicodedata.normalize("NFKC", text).casefold().translate(HYPHENS).split())
+    # Keep the number sign expected by the Russian fixture patterns.
+    text = "№".join(unicodedata.normalize("NFKC", part) for part in text.split("№"))
+    return " ".join(text.casefold().translate(HYPHENS).split())
 
 
 def read_cases(path: Path, ids: list[str]) -> list[dict]:
@@ -70,17 +75,105 @@ def hits(ids: set[str], slots: list[set[str]]) -> list[bool]:
     return [bool(ids & matches) for matches in slots]
 
 
-def grade_answer(answer, case: dict, slots: list[set[str]]) -> dict:
-    text = normalized(answer.text)
+def grade_answer(answer, case: dict, slots: list[set[str]], corpus) -> dict:
+    status = answer.status if answer is not None else "error"
+    text = normalized(answer.text) if answer is not None else ""
     missing_patterns = [pattern for pattern in case["must"] if not re.search(pattern, text)]
-    citations = {citation.id for citation in answer.citations}
+    citations = answer.citations if answer is not None else []
+    valid_citations = [
+        citation for citation in citations
+        if (passage := corpus.passages.get(citation.id)) is not None
+        and citation.document_id == passage.document_id
+        and citation.quote and citation.quote in passage.text
+    ]
+    valid_ids = {citation.id for citation in valid_citations}
     required_cites = case.get("cite", range(len(slots)))
-    missing_citations = [index for index in required_cites if not (citations & slots[index])]
+    missing_citations = [index for index in required_cites if not (valid_ids & slots[index])]
     return {
-        "status": answer.status,
-        "status_ok": answer.status in case["statuses"],
+        "status": status,
+        "status_ok": status in case["statuses"],
+        "unwanted_no_answer": status in NO_ANSWER_STATUSES and status not in case["statuses"],
         "missing_patterns": missing_patterns,
         "missing_citations": missing_citations,
+        "invalid_citations": len(citations) - len(valid_citations),
+        "requires_citations": bool(required_cites),
+    }
+
+
+def passed(grade: dict) -> bool:
+    return (grade["status_ok"] and not grade["missing_patterns"]
+            and not grade["missing_citations"] and not grade["invalid_citations"])
+
+
+def request_counts(assistant) -> Counter | None:
+    read_counts = getattr(assistant.gateway, "request_counts", None)
+    if not callable(read_counts):
+        return None
+    counts = read_counts()
+    return Counter({endpoint: counts[endpoint] for endpoint in ENDPOINTS if endpoint in counts})
+
+
+def request_delta(before: Counter | None, after: Counter | None) -> dict | None:
+    return dict(after - before) if before is not None and after is not None else None
+
+
+def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[int], timeout: float) -> dict:
+    retrieve, select = live.retrieve, live.context
+    answer_once = getattr(live, "_answer_once", None)
+    rankings, contexts = [], []
+    initial_answer = None
+    retry_start = None
+
+    def capture_retrieval(*args, **kwargs):
+        found = retrieve(*args, **kwargs)
+        rankings.append(found)
+        return found
+
+    def capture_context(*args, **kwargs):
+        nonlocal retry_start
+        if len(contexts) == 1:
+            retry_start = request_counts(live)
+        selected = select(*args, **kwargs)
+        contexts.append(selected)
+        return selected
+
+    def capture_answer(*args, **kwargs):
+        nonlocal initial_answer
+        result = answer_once(*args, **kwargs)
+        if initial_answer is None:
+            initial_answer = result[0]
+        return result
+
+    before = request_counts(live)
+    error_type = None
+    started = time.perf_counter()
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(live, "retrieve", capture_retrieval))
+        stack.enter_context(patch.object(live, "context", capture_context))
+        if callable(answer_once):
+            stack.enter_context(patch.object(live, "_answer_once", capture_answer))
+        try:
+            answer = live.ask(case["question"], deadline=time.monotonic() + timeout)
+        except Exception as exc:
+            answer = None
+            error_type = type(exc).__name__
+    elapsed = time.perf_counter() - started
+    after = request_counts(live)
+    grade = grade_answer(answer, case, slots, live.corpus)
+    initial = grade_answer(initial_answer, case, slots, live.corpus) if initial_answer is not None else None
+    ranked = rankings[0] if rankings else []
+    retried = len(contexts) > 1
+    return {
+        **grade,
+        "elapsed_seconds": round(elapsed, 4),
+        "exception_type": error_type,
+        "ranked": {k: hits({p.id for p in ranked[:k]}, slots) for k in cutoffs},
+        "context": hits({p.id for p in contexts[0]} if contexts else set(), slots),
+        "additional_search": retried,
+        "initial_grade": initial,
+        "retry_recovered": not passed(initial) and passed(grade) if retried and initial is not None else None,
+        "requests": request_delta(before, after),
+        "retry_requests": request_delta(retry_start, after),
     }
 
 
@@ -90,8 +183,15 @@ def evaluate(args: argparse.Namespace, cases: list[dict]) -> dict:
 
     local = load_assistant(args.kb, offline=True)
     live = None
+    preparation = None
     if args.live and local.settings.ready:
+        started = time.perf_counter()
         live = load_assistant(args.kb, deadline=time.monotonic() + args.timeout)
+        preparation = {
+            "elapsed_seconds": round(time.perf_counter() - started, 4),
+            "requests": request_delta(Counter(), request_counts(live)),
+            "dense_active": bool(live.vectors),
+        }
 
     results = []
     for case in cases:
@@ -120,23 +220,14 @@ def evaluate(args: argparse.Namespace, cases: list[dict]) -> dict:
             "search_ms": round((time.perf_counter() - started) * 1000, 2),
         }
         if live is not None:
-            contexts = []
-            select = live.context
-
-            def capture_context(*args, **kwargs):
-                selected = select(*args, **kwargs)
-                contexts.append(selected)
-                return selected
-
-            started = time.perf_counter()
-            with patch.object(live, "context", capture_context):
-                answer = live.ask(case["question"], deadline=time.monotonic() + args.timeout)
-            result["live"] = grade_answer(answer, case, slots)
-            result["live"]["elapsed_seconds"] = round(time.perf_counter() - started, 2)
-            result["live"]["context"] = hits({p.id for p in contexts[0]} if contexts else set(), slots)
-            result["live"]["additional_search"] = len(contexts) > 1
+            result["live"] = evaluate_live_case(live, case, slots, args.k, args.timeout)
         results.append(result)
-    return {"live_ready": live is not None, "cases": results}
+    return {
+        "live_ready": live is not None,
+        "live_preparation": preparation,
+        "live_requests": request_delta(Counter(), request_counts(live)) if live is not None else None,
+        "cases": results,
+    }
 
 
 @contextmanager
@@ -190,7 +281,17 @@ def metrics(run: dict, cutoffs: list[int]) -> dict:
     rows = run["cases"]
     with_evidence = [row for row in rows if row["context"]]
     online = [row["live"] for row in rows if "live" in row]
+    online_evidence = [row for row in online if row["context"]]
+    online_required_citations = [row for row in online if row["requires_citations"]]
     online_times = sorted(row["elapsed_seconds"] for row in online)
+    retries = [row for row in online if row["additional_search"]]
+    graded_retries = [row for row in retries if row["retry_recovered"] is not None]
+    recovered = sum(row["retry_recovered"] for row in graded_retries)
+    retry_requests: Counter = Counter()
+    for row in retries:
+        retry_requests.update(row["retry_requests"] or {})
+    unwanted = Counter(row["status"] for row in online if row["unwanted_no_answer"])
+    preparation = run["live_preparation"]
     return {
         "cases": len(rows),
         "cases_with_evidence": len(with_evidence),
@@ -207,19 +308,41 @@ def metrics(run: dict, cutoffs: list[int]) -> dict:
         "live_cases": len(online),
         "live_status_ok": sum(row["status_ok"] for row in online),
         "live_facts_ok": sum(not row["missing_patterns"] for row in online),
-        "live_citations_ok": sum(not row["missing_citations"] for row in online),
-        "live_pass": sum(
-            row["status_ok"] and not row["missing_patterns"] and not row["missing_citations"]
-            for row in online
-        ),
-        "live_context_recall": mean_recall([row["context"] for row in online if row["context"]]),
-        "live_additional_search": sum(row["additional_search"] for row in online),
+        "live_citations_ok": sum(not row["missing_citations"] and not row["invalid_citations"] for row in online),
+        "live_cases_requiring_citations": len(online_required_citations),
+        "live_supported": sum(not row["missing_citations"] and not row["invalid_citations"]
+                              for row in online_required_citations),
+        "live_pass": sum(passed(row) for row in online),
+        "live_technical_errors": sum(row["status"] == "error" for row in online),
+        "live_unwanted_no_answer": sum(unwanted.values()),
+        "live_unwanted_no_answer_statuses": dict(unwanted),
+        **{
+            f"live_recall@{k}": mean_recall([row["ranked"][str(k)] for row in online_evidence])
+            for k in cutoffs
+        },
+        "live_context_recall": mean_recall([row["context"] for row in online_evidence]),
+        "live_context_complete": sum(all(row["context"]) for row in online_evidence),
+        "live_additional_search": len(retries),
+        "live_retry_rate": len(retries) / len(online) if online else None,
+        "live_retry_recovered": recovered,
+        "live_retry_graded": len(graded_retries),
+        "live_retry_recovery_rate": recovered / len(graded_retries) if graded_retries else None,
+        "live_retry_requests": dict(retry_requests) if run["live_requests"] is not None else None,
+        "live_p50_seconds": statistics.median(online_times) if online_times else None,
         "live_p95_seconds": online_times[math.ceil(0.95 * len(online_times)) - 1] if online_times else None,
+        "live_elapsed_seconds": round(preparation["elapsed_seconds"] + sum(online_times), 4)
+        if preparation is not None else None,
     }
 
 
 def percent(value: float | None) -> str:
     return f"{value:.1%}" if value is not None else "—"
+
+
+def format_requests(counts: dict | None) -> str:
+    if counts is None:
+        return "недоступно для этой версии"
+    return ", ".join(f"{endpoint} {counts.get(endpoint, 0)}" for endpoint in ENDPOINTS)
 
 
 def print_result(label: str, run: dict, cases: list[dict], args: argparse.Namespace) -> None:
@@ -235,8 +358,22 @@ def print_result(label: str, run: dict, cases: list[dict], args: argparse.Namesp
         live_total = m["live_cases"]
         print(f"  API: статус {m['live_status_ok']}/{live_total}, шаблоны {m['live_facts_ok']}/{live_total}, "
               f"источники {m['live_citations_ok']}/{live_total}, всё вместе {m['live_pass']}/{live_total}")
+        print(f"  Ожидаемые ссылки с точными цитатами {m['live_supported']}/{m['live_cases_requiring_citations']}, "
+              f"технических ошибок {m['live_technical_errors']}, "
+              f"неожиданных отказов или уточнений {m['live_unwanted_no_answer']}")
+        print("  API   " + "   ".join(f"Recall@{k} {percent(m[f'live_recall@{k}'])}" for k in args.k))
         print(f"  Полнота первого контекста API {percent(m['live_context_recall'])}, "
-              f"повторный поиск {m['live_additional_search']}/{live_total}, p95 {m['live_p95_seconds']:g} с")
+              f"все фрагменты {m['live_context_complete']}/{total}")
+        print(f"  Повторная генерация после поиска {m['live_additional_search']}/{live_total}, "
+              f"восстановлено {m['live_retry_recovered']}/{m['live_retry_graded']}, "
+              f"запросы повтора {format_requests(m['live_retry_requests'])}")
+        preparation = run["live_preparation"]
+        print(f"  p50 {m['live_p50_seconds']:g} с, p95 {m['live_p95_seconds']:g} с, "
+              f"подготовка и обработка {m['live_elapsed_seconds']:g} с")
+        print(f"  Запросы всего {format_requests(run['live_requests'])}")
+        index_status = "векторный индекс используется" if preparation["dense_active"] else "поиск без векторного индекса"
+        print(f"  Подготовка {preparation['elapsed_seconds']:g} с, {index_status}, "
+              f"запросы {format_requests(preparation['requests'])}")
         print("  Проверка шаблонов и источников приближённая. Она не заменяет экспертную оценку ответа.")
     elif args.live:
         print("  Прогон API пропущен. Требуются LLM_BASE_URL, LLM_API_KEY и LLM_MODEL.")
@@ -251,7 +388,14 @@ def print_result(label: str, run: dict, cases: list[dict], args: argparse.Namesp
             if "live" in result:
                 live = result["live"]
                 print(f"      статус {live['status']}, шаблонов пропущено {len(live['missing_patterns'])}, "
-                      f"источников пропущено {len(live['missing_citations'])}")
+                      f"источников пропущено {len(live['missing_citations'])}, "
+                      f"некорректных цитат {live['invalid_citations']}")
+                print(f"      время {live['elapsed_seconds']:g} с, запросы {format_requests(live['requests'])}")
+                if live["initial_grade"] is not None and live["additional_search"]:
+                    print(f"      первый статус {live['initial_grade']['status']}, "
+                          f"проверки до и после повтора {int(passed(live['initial_grade']))} → {int(passed(live))}")
+                if live["exception_type"]:
+                    print(f"      исключение {live['exception_type']}")
 
 
 def main() -> None:

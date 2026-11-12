@@ -1,0 +1,731 @@
+{
+  "date_moscow": "2026-11-12",
+  "status": "locally-tested-candidate-no-live-deepseek",
+  "base_commit": "0f6386e79b2a167a9dabcba725fae4c72a1e2c70",
+  "branch": "codex/psb-submission-6",
+  "python_local": "3.12.9",
+  "python_docker": "3.12.16",
+  "rapidfuzz": "3.14.1",
+  "unit_tests_passed": 75,
+  "artifact": {
+    "path": "submissions/6.zip",
+    "bytes": 36435,
+    "sha256": "f43b63d999f60c04d25fda269632d71be3d9804f252684bc3461e2fbca4f36b8",
+    "runtime_sha256": {
+      "solution.py": "7f8a99450608b8af6e2bff21bbc56b017cb04ea8798dc66328522c4c33048286",
+      "assistant.py": "1bd9d159c4a63321c2f62f764ca0f1213ea5ec8403183ab3261520b062fdf48b",
+      "corpus.py": "843ad40f524c15277965ba10647d19840eb09b6e8af96fb764b9766b8959a7de",
+      "proxy.py": "7a3f2d181c437890b1fd676b4d5412708cfa9fa4ffecf63e7eef9b58ac9e352b",
+      "telemetry.py": "a55980ee61f59bb64ed8792e287acff43ea023f67d3a56842301253500a1dbde",
+      "requirements.txt": "e27a8890470a0075479c84f24279341c67cd518bb28174b24352d454cce2dcb8"
+    },
+    "preserved_sha256": {
+      "data\\knowledge-base.zip": "cea8ef2c8f6c8b9f498efacf705b97bf3da53cc78f366f9b1fef7a6de66327e0",
+      "submissions\\1.zip": "e99245e771cb78e7a3a2447197843169ac8ee80af57a271aaf149cc1a99be541",
+      "submissions\\2.zip": "0e0ec7e7358cdb6f1f96f39bd40e909b95dbe75a848afd4f07f9b8c036b72ead",
+      "submissions\\3.zip": "b1e6d550710ba41af2c39006702f4b3fa707e8c613bb9b11a47a8d8aae337ebe",
+      "submissions\\4.zip": "7e10f2bedc91c6b28315f91cf19f686a5f8c95d47637dfa806a2df13ca0aa0e0",
+      "submissions\\5.zip": "020ba2118504134ae8e7d4b9a961ff47e103b95360b6a82dd72aab6afba93d22"
+    }
+  },
+  "reserve6": {
+    "cases": 20,
+    "groups": 5,
+    "sha256": "8770a89859acfbefdca9a7708ff922e370b0676a66dd9e66351231316c63ca90",
+    "used_for_tuning": false,
+    "new_documents": false
+  },
+  "retrieval_bm25": {
+    "cases": {
+      "3": {
+        "recall@5": 0.7901234567901234,
+        "recall@10": 0.9629629629629629,
+        "context_complete": 27,
+        "cases_with_evidence": 27,
+        "index_complete": 27
+      },
+      "5": {
+        "recall@5": 0.7901234567901234,
+        "recall@10": 0.9629629629629629,
+        "context_complete": 27,
+        "cases_with_evidence": 27,
+        "index_complete": 27
+      },
+      "6": {
+        "recall@5": 0.7901234567901234,
+        "recall@10": 0.9629629629629629,
+        "context_complete": 27,
+        "cases_with_evidence": 27,
+        "index_complete": 27
+      }
+    },
+    "holdout": {
+      "3": {
+        "recall@5": 0.7777777777777778,
+        "recall@10": 0.8703703703703703,
+        "context_complete": 16,
+        "cases_with_evidence": 18,
+        "index_complete": 18
+      },
+      "5": {
+        "recall@5": 0.8240740740740741,
+        "recall@10": 0.9444444444444444,
+        "context_complete": 18,
+        "cases_with_evidence": 18,
+        "index_complete": 18
+      },
+      "6": {
+        "recall@5": 0.8240740740740741,
+        "recall@10": 0.9444444444444444,
+        "context_complete": 18,
+        "cases_with_evidence": 18,
+        "index_complete": 18
+      }
+    },
+    "reserve5": {
+      "3": {
+        "recall@5": 0.875,
+        "recall@10": 0.90625,
+        "context_complete": 16,
+        "cases_with_evidence": 16,
+        "index_complete": 16
+      },
+      "5": {
+        "recall@5": 0.875,
+        "recall@10": 0.90625,
+        "context_complete": 16,
+        "cases_with_evidence": 16,
+        "index_complete": 16
+      },
+      "6": {
+        "recall@5": 0.875,
+        "recall@10": 0.90625,
+        "context_complete": 16,
+        "cases_with_evidence": 16,
+        "index_complete": 16
+      }
+    },
+    "reserve6": {
+      "3": {
+        "recall@5": 0.9,
+        "recall@10": 1.0,
+        "context_complete": 20,
+        "cases_with_evidence": 20,
+        "index_complete": 20
+      },
+      "5": {
+        "recall@5": 0.9,
+        "recall@10": 1.0,
+        "context_complete": 20,
+        "cases_with_evidence": 20,
+        "index_complete": 20
+      },
+      "6": {
+        "recall@5": 0.9,
+        "recall@10": 1.0,
+        "context_complete": 20,
+        "cases_with_evidence": 20,
+        "index_complete": 20
+      }
+    }
+  },
+  "controlled_demo": {
+    "3": {
+      "expected_count": 18,
+      "wall_seconds": 2.084382100001676,
+      "p50_seconds": 0.34,
+      "p95_seconds": 0.64,
+      "calls": {
+        "/chat/completions": 38
+      },
+      "calls_by_phase": {
+        "draft": 20,
+        "verify": 18
+      },
+      "contract": {
+        "header": [
+          "id",
+          "answer"
+        ],
+        "rows": 18,
+        "utf8": true,
+        "ids_match_and_unique": true,
+        "csv_strict": true,
+        "min_chars": 113,
+        "max_chars": 475
+      }
+    },
+    "5": {
+      "expected_count": 18,
+      "wall_seconds": 1.9088408999959938,
+      "p50_seconds": 0.33,
+      "p95_seconds": 0.78,
+      "calls": {
+        "/chat/completions": 38
+      },
+      "calls_by_phase": {
+        "draft": 20,
+        "verify": 18
+      },
+      "contract": {
+        "header": [
+          "id",
+          "answer"
+        ],
+        "rows": 18,
+        "utf8": true,
+        "ids_match_and_unique": true,
+        "csv_strict": true,
+        "min_chars": 113,
+        "max_chars": 475
+      }
+    },
+    "6": {
+      "expected_count": 18,
+      "wall_seconds": 1.9723993000079645,
+      "p50_seconds": 0.35,
+      "p95_seconds": 0.72,
+      "calls": {
+        "/chat/completions": 38
+      },
+      "calls_by_phase": {
+        "draft": 20,
+        "verify": 18
+      },
+      "contract": {
+        "header": [
+          "id",
+          "answer"
+        ],
+        "rows": 18,
+        "utf8": true,
+        "ids_match_and_unique": true,
+        "csv_strict": true,
+        "min_chars": 113,
+        "max_chars": 475
+      }
+    }
+  },
+  "controlled_regressions": {
+    "mode": "controlled-no-model",
+    "python": "3.12.9",
+    "kb_sha256": "cea8ef2c8f6c8b9f498efacf705b97bf3da53cc78f366f9b1fef7a6de66327e0",
+    "versions": [
+      {
+        "version": "3",
+        "mode": "controlled-no-model",
+        "cases": [
+          {
+            "name": "signature-date",
+            "question": "Какой порядок согласования по п. 3.1 регламента действовал на дату подписания договора от 28 февраля 2025 года, если товар доставили 2 марта 2025 года?",
+            "scope": {
+              "event_role": "signature",
+              "comparison": true,
+              "date_ranges": [
+                [
+                  "2025-02-28",
+                  "2025-02-28"
+                ],
+                [
+                  "2025-03-02",
+                  "2025-03-02"
+                ]
+              ]
+            },
+            "status": "answered",
+            "answer": "Согласование оформляется на бумажном листе согласования. (Регламент согласования договоров ред 2023 (утратил силу), п. 3.1)",
+            "citations": [
+              "P80"
+            ],
+            "calls": {
+              "generation": 1,
+              "verification": 1
+            },
+            "controlled_seconds": 0.015,
+            "fixed_facts_complete": true
+          },
+          {
+            "name": "historical-comparison",
+            "question": "Как изменился порог согласования с финансовым директором на 2 марта 2025 года? Назовите прежний и новый порог по п. 2.3 регламента.",
+            "scope": {
+              "event_role": "",
+              "comparison": false,
+              "date_ranges": [
+                [
+                  "2025-03-02",
+                  "2025-03-02"
+                ]
+              ]
+            },
+            "status": "answered",
+            "answer": "Порог вырос с суммы свыше 1 млн руб. в прежней редакции до суммы свыше 3 млн руб. в новой. (Регламент согласования договоров ред 2023 (утратил силу), п. 2.3) (Регламент согласования договоров ред 2025, п. 2.3)",
+            "citations": [
+              "P78",
+              "P90"
+            ],
+            "calls": {
+              "generation": 1,
+              "verification": 1
+            },
+            "controlled_seconds": 0.0,
+            "fixed_facts_complete": true
+          },
+          {
+            "name": "partial-retry",
+            "question": "В июне 2025 договор ООО «Меридиан» подписан. Назовите три отдельных срока и точки отсчёта: передача подписанного оригинала, размещение скана и выдача оригинала сотруднику другого подразделения. Как оформляется выдача?",
+            "scope": {
+              "event_role": "",
+              "comparison": false,
+              "date_ranges": [
+                [
+                  "2025-06-01",
+                  "2025-06-30"
+                ]
+              ]
+            },
+            "status": "partial",
+            "answer": "Оригинал передают в юридический отдел в течение 3 рабочих дней с даты подписания. (Регламент согласования договоров ред 2025, п. 3.2) Скан размещают в СЭД не позднее 1 рабочего дня после поступления оригинала в архив. (Служебная записка об архиве договоров, абзац «Сканированные копии договоров размещаются в СЭД не…») Уточните порядок выдачи оригинала сотруднику другого подразделения.",
+            "citations": [
+              "P104",
+              "P94"
+            ],
+            "calls": {
+              "generation": 2,
+              "verification": 2
+            },
+            "controlled_seconds": 0.016,
+            "fixed_facts_complete": true
+          }
+        ],
+        "runtime_sha256": {
+          "solution.py": "7f8a99450608b8af6e2bff21bbc56b017cb04ea8798dc66328522c4c33048286",
+          "assistant.py": "26cbb8072907d4dde7a4fb3d99126ea9fe7bd6728e737cd81d86b358ee361d13",
+          "corpus.py": "c7d65294b0f7638e864a63cb5e51aa477b02c1f5e70a5e25555f2a5809206ab2",
+          "proxy.py": "7a3f2d181c437890b1fd676b4d5412708cfa9fa4ffecf63e7eef9b58ac9e352b",
+          "telemetry.py": "a55980ee61f59bb64ed8792e287acff43ea023f67d3a56842301253500a1dbde",
+          "requirements.txt": "e27a8890470a0075479c84f24279341c67cd518bb28174b24352d454cce2dcb8"
+        }
+      },
+      {
+        "version": "4",
+        "mode": "controlled-no-model",
+        "cases": [
+          {
+            "name": "signature-date",
+            "question": "Какой порядок согласования по п. 3.1 регламента действовал на дату подписания договора от 28 февраля 2025 года, если товар доставили 2 марта 2025 года?",
+            "scope": {
+              "event_role": "signature",
+              "comparison": false,
+              "date_ranges": [
+                [
+                  "2025-03-02",
+                  "2025-03-02"
+                ]
+              ]
+            },
+            "status": "insufficient",
+            "answer": "В предоставленной базе знаний недостаточно подтверждений для достоверного ответа на этот вопрос.",
+            "citations": [],
+            "calls": {
+              "generation": 1,
+              "verification": 0
+            },
+            "controlled_seconds": 0.0,
+            "fixed_facts_complete": false
+          },
+          {
+            "name": "historical-comparison",
+            "question": "Как изменился порог согласования с финансовым директором на 2 марта 2025 года? Назовите прежний и новый порог по п. 2.3 регламента.",
+            "scope": {
+              "event_role": "",
+              "comparison": false,
+              "date_ranges": [
+                [
+                  "2025-03-02",
+                  "2025-03-02"
+                ]
+              ]
+            },
+            "status": "insufficient",
+            "answer": "В предоставленной базе знаний недостаточно подтверждений для достоверного ответа на этот вопрос.",
+            "citations": [],
+            "calls": {
+              "generation": 1,
+              "verification": 1
+            },
+            "controlled_seconds": 0.016,
+            "fixed_facts_complete": false
+          },
+          {
+            "name": "partial-retry",
+            "question": "В июне 2025 договор ООО «Меридиан» подписан. Назовите три отдельных срока и точки отсчёта: передача подписанного оригинала, размещение скана и выдача оригинала сотруднику другого подразделения. Как оформляется выдача?",
+            "scope": {
+              "event_role": "",
+              "comparison": false,
+              "date_ranges": [
+                [
+                  "2025-06-01",
+                  "2025-06-30"
+                ]
+              ]
+            },
+            "status": "partial",
+            "answer": "Оригинал передают в юридический отдел в течение 3 рабочих дней с даты подписания. (Регламент согласования договоров ред 2025, п. 3.2) Нужно найти срок размещения скана и порядок выдачи оригинала.",
+            "citations": [
+              "P94"
+            ],
+            "calls": {
+              "generation": 2,
+              "verification": 2
+            },
+            "controlled_seconds": 0.015,
+            "fixed_facts_complete": false
+          }
+        ],
+        "runtime_sha256": {
+          "solution.py": "7f8a99450608b8af6e2bff21bbc56b017cb04ea8798dc66328522c4c33048286",
+          "assistant.py": "30d441371c266006284450eda6075cbae24aa24e48ac9f1361dc8d37658da692",
+          "corpus.py": "5f7315ed98e55a7c0983469ee3bf0350cf33cf4abe5149224c1906758998445b",
+          "proxy.py": "7a3f2d181c437890b1fd676b4d5412708cfa9fa4ffecf63e7eef9b58ac9e352b",
+          "telemetry.py": "a55980ee61f59bb64ed8792e287acff43ea023f67d3a56842301253500a1dbde",
+          "requirements.txt": "e27a8890470a0075479c84f24279341c67cd518bb28174b24352d454cce2dcb8"
+        }
+      },
+      {
+        "version": "5",
+        "mode": "controlled-no-model",
+        "cases": [
+          {
+            "name": "signature-date",
+            "question": "Какой порядок согласования по п. 3.1 регламента действовал на дату подписания договора от 28 февраля 2025 года, если товар доставили 2 марта 2025 года?",
+            "scope": {
+              "event_role": "delivery",
+              "comparison": false,
+              "date_ranges": [
+                [
+                  "2025-03-02",
+                  "2025-03-02"
+                ]
+              ]
+            },
+            "status": "insufficient",
+            "answer": "В предоставленной базе знаний недостаточно подтверждений для достоверного ответа на этот вопрос.",
+            "citations": [],
+            "calls": {
+              "generation": 1,
+              "verification": 0
+            },
+            "controlled_seconds": 0.016,
+            "fixed_facts_complete": false
+          },
+          {
+            "name": "historical-comparison",
+            "question": "Как изменился порог согласования с финансовым директором на 2 марта 2025 года? Назовите прежний и новый порог по п. 2.3 регламента.",
+            "scope": {
+              "event_role": "",
+              "comparison": false,
+              "date_ranges": [
+                [
+                  "2025-03-02",
+                  "2025-03-02"
+                ]
+              ]
+            },
+            "status": "insufficient",
+            "answer": "В предоставленной базе знаний недостаточно подтверждений для достоверного ответа на этот вопрос.",
+            "citations": [],
+            "calls": {
+              "generation": 1,
+              "verification": 1
+            },
+            "controlled_seconds": 0.0,
+            "fixed_facts_complete": false
+          },
+          {
+            "name": "partial-retry",
+            "question": "В июне 2025 договор ООО «Меридиан» подписан. Назовите три отдельных срока и точки отсчёта: передача подписанного оригинала, размещение скана и выдача оригинала сотруднику другого подразделения. Как оформляется выдача?",
+            "scope": {
+              "event_role": "signature",
+              "comparison": false,
+              "date_ranges": [
+                [
+                  "2025-06-01",
+                  "2025-06-30"
+                ]
+              ]
+            },
+            "status": "partial",
+            "answer": "Оригинал передают в юридический отдел в течение 3 рабочих дней с даты подписания. (Регламент согласования договоров ред 2025, п. 3.2) Нужно найти срок размещения скана и порядок выдачи оригинала.",
+            "citations": [
+              "P94"
+            ],
+            "calls": {
+              "generation": 2,
+              "verification": 2
+            },
+            "controlled_seconds": 0.016,
+            "fixed_facts_complete": false
+          }
+        ],
+        "runtime_sha256": {
+          "solution.py": "7f8a99450608b8af6e2bff21bbc56b017cb04ea8798dc66328522c4c33048286",
+          "assistant.py": "1f0e385fef24a030df6954358246e2e90cf18c4c0c5b8bfab494a62e221e8b71",
+          "corpus.py": "b8b5b3405bff2853426a79084c984312e094f41eb3b29975dfa5f69cd62eb02b",
+          "proxy.py": "7a3f2d181c437890b1fd676b4d5412708cfa9fa4ffecf63e7eef9b58ac9e352b",
+          "telemetry.py": "a55980ee61f59bb64ed8792e287acff43ea023f67d3a56842301253500a1dbde",
+          "requirements.txt": "e27a8890470a0075479c84f24279341c67cd518bb28174b24352d454cce2dcb8"
+        }
+      },
+      {
+        "version": "6",
+        "mode": "controlled-no-model",
+        "cases": [
+          {
+            "name": "signature-date",
+            "question": "Какой порядок согласования по п. 3.1 регламента действовал на дату подписания договора от 28 февраля 2025 года, если товар доставили 2 марта 2025 года?",
+            "scope": {
+              "event_role": "signature",
+              "comparison": false,
+              "date_ranges": [
+                [
+                  "2025-02-28",
+                  "2025-02-28"
+                ]
+              ]
+            },
+            "status": "answered",
+            "answer": "Согласование оформляется на бумажном листе согласования. (Регламент согласования договоров ред 2023 (утратил силу), п. 3.1)",
+            "citations": [
+              "P80"
+            ],
+            "calls": {
+              "generation": 1,
+              "verification": 1
+            },
+            "controlled_seconds": 0.0,
+            "fixed_facts_complete": true
+          },
+          {
+            "name": "historical-comparison",
+            "question": "Как изменился порог согласования с финансовым директором на 2 марта 2025 года? Назовите прежний и новый порог по п. 2.3 регламента.",
+            "scope": {
+              "event_role": "",
+              "comparison": false,
+              "date_ranges": [
+                [
+                  "2025-03-02",
+                  "2025-03-02"
+                ]
+              ]
+            },
+            "status": "answered",
+            "answer": "Порог вырос с суммы свыше 1 млн руб. в прежней редакции до суммы свыше 3 млн руб. в новой. (Регламент согласования договоров ред 2023 (утратил силу), п. 2.3) (Регламент согласования договоров ред 2025, п. 2.3)",
+            "citations": [
+              "P78",
+              "P90"
+            ],
+            "calls": {
+              "generation": 1,
+              "verification": 1
+            },
+            "controlled_seconds": 0.015,
+            "fixed_facts_complete": true
+          },
+          {
+            "name": "partial-retry",
+            "question": "В июне 2025 договор ООО «Меридиан» подписан. Назовите три отдельных срока и точки отсчёта: передача подписанного оригинала, размещение скана и выдача оригинала сотруднику другого подразделения. Как оформляется выдача?",
+            "scope": {
+              "event_role": "signature",
+              "comparison": false,
+              "date_ranges": [
+                [
+                  "2025-06-01",
+                  "2025-06-30"
+                ]
+              ]
+            },
+            "status": "partial",
+            "answer": "Оригинал передают в юридический отдел в течение 3 рабочих дней с даты подписания. (Регламент согласования договоров ред 2025, п. 3.2) Скан размещают в СЭД не позднее 1 рабочего дня после поступления оригинала в архив. (Служебная записка об архиве договоров, абзац «Сканированные копии договоров размещаются в СЭД не…») Уточните порядок выдачи оригинала сотруднику другого подразделения.",
+            "citations": [
+              "P104",
+              "P94"
+            ],
+            "calls": {
+              "generation": 2,
+              "verification": 2
+            },
+            "controlled_seconds": 0.016,
+            "fixed_facts_complete": true
+          }
+        ],
+        "runtime_sha256": {
+          "solution.py": "7f8a99450608b8af6e2bff21bbc56b017cb04ea8798dc66328522c4c33048286",
+          "assistant.py": "1bd9d159c4a63321c2f62f764ca0f1213ea5ec8403183ab3261520b062fdf48b",
+          "corpus.py": "843ad40f524c15277965ba10647d19840eb09b6e8af96fb764b9766b8959a7de",
+          "proxy.py": "7a3f2d181c437890b1fd676b4d5412708cfa9fa4ffecf63e7eef9b58ac9e352b",
+          "telemetry.py": "a55980ee61f59bb64ed8792e287acff43ea023f67d3a56842301253500a1dbde",
+          "requirements.txt": "e27a8890470a0075479c84f24279341c67cd518bb28174b24352d454cce2dcb8"
+        }
+      }
+    ]
+  },
+  "controlled_retry_old_cases": {
+    "3": {
+      "off_complete": 0,
+      "on_complete": 2,
+      "off_calls": {
+        "/chat/completions": 4
+      },
+      "on_calls": {
+        "/chat/completions": 8
+      },
+      "recovered": [
+        "holdout-approval-february",
+        "holdout-archive-three-clocks"
+      ]
+    },
+    "5": {
+      "off_complete": 2,
+      "on_complete": 2,
+      "off_calls": {
+        "/chat/completions": 4
+      },
+      "on_calls": {
+        "/chat/completions": 4
+      },
+      "recovered": []
+    },
+    "6": {
+      "off_complete": 2,
+      "on_complete": 2,
+      "off_calls": {
+        "/chat/completions": 4
+      },
+      "on_calls": {
+        "/chat/completions": 4
+      },
+      "recovered": []
+    }
+  },
+  "controlled_source_mutations": {
+    "original": {
+      "status": "answered",
+      "csv_answer": "Арендная плата составляет 450 000 рублей в месяц, включая НДС. (Договор аренды № А-08/2024 Северный Склад, п. 3.1) Платёж вносится не позднее 5-го числа текущего месяца. (Договор аренды № А-08/2024 Северный Склад, п. 3.2)",
+      "calls_csv_and_web": {
+        "/chat/completions": 4
+      },
+      "quote_matches_full_document": true
+    },
+    "changed": {
+      "status": "answered",
+      "csv_answer": "Арендная плата составляет 473 500 рублей в месяц, включая НДС. (Договор аренды № А-08/2024 Северный Склад, п. 3.1) Платёж вносится не позднее 5-го числа текущего месяца. (Договор аренды № А-08/2024 Северный Склад, п. 3.2)",
+      "calls_csv_and_web": {
+        "/chat/completions": 4
+      },
+      "quote_matches_full_document": true
+    },
+    "removed": {
+      "status": "partial",
+      "csv_answer": "Платёж вносится не позднее 5-го числа текущего месяца. (Договор аренды № А-08/2024 Северный Склад, п. 3.2) В базе не нашёл размер арендной платы по договору с ООО «Северный Склад».",
+      "calls_csv_and_web": {
+        "/chat/completions": 4
+      },
+      "quote_matches_full_document": true
+    }
+  },
+  "controlled_arithmetic": {
+    "fixture_chat_calls": 18,
+    "ask_wall_seconds": 0.07969630000297911,
+    "ask_p50_seconds": 0.008772900007897988,
+    "ask_p95_seconds": 0.009930300002451986,
+    "csv_rows": 9,
+    "exact_event_scopes": 9
+  },
+  "controlled_search_api_failure": {
+    "expected_count": 18,
+    "wall_seconds": 2.403050400011125,
+    "p50_seconds": 0.47,
+    "p95_seconds": 0.7,
+    "calls": {
+      "/embeddings": 1,
+      "/rerank": 18,
+      "/chat/completions": 36
+    },
+    "calls_by_phase": {
+      "draft": 19,
+      "verify": 17
+    },
+    "contract": {
+      "header": [
+        "id",
+        "answer"
+      ],
+      "rows": 18,
+      "utf8": true,
+      "ids_match_and_unique": true,
+      "csv_strict": true,
+      "min_chars": 80,
+      "max_chars": 475
+    }
+  },
+  "compose": {
+    "offline_chat": true,
+    "october_1_and_2_addresses_and_sources": true,
+    "browser_quote_opened": true,
+    "phoenix": {
+      "project": "alfa-psb",
+      "observed_spans": [
+        {
+          "name": "assistant.answer",
+          "attributes": {
+            "psb.answer.citations": [
+              "P25",
+              "P26",
+              "P33",
+              "P62",
+              "P35"
+            ],
+            "psb.answer.status": "offline"
+          }
+        },
+        {
+          "name": "assistant.retrieve",
+          "attributes": {
+            "psb.retrieval.dense": false,
+            "psb.retrieval.ids": [
+              "P25",
+              "P26",
+              "P33",
+              "P62",
+              "P35",
+              "P21",
+              "P31",
+              "P20",
+              "P32",
+              "P22",
+              "P23",
+              "P29",
+              "P36",
+              "P34",
+              "P363",
+              "P281",
+              "P354",
+              "P571"
+            ],
+            "psb.retrieval.anchor_docs": [
+              "D2",
+              "D4"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "limits": [
+    "No live DeepSeek evaluation: credentials absent.",
+    "Scripted verdicts test orchestration, not semantic verifier quality.",
+    "Reserve covers new cases within an already studied corpus.",
+    "Regex grading does not prove complete legal correctness.",
+    "Platform runtime and hidden score remain unmeasured."
+  ]
+}

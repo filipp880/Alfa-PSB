@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from contextlib import ExitStack, contextmanager
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import asdict, replace
 import json
 import math
@@ -31,6 +31,8 @@ ROOT = Path(__file__).resolve().parent
 HYPHENS = str.maketrans("ё‐‒–—−", "е-----")
 ENDPOINTS = ("/chat/completions", "/embeddings", "/rerank")
 NO_ANSWER_STATUSES = {"refusal", "insufficient", "clarification", "out_of_scope"}
+SUBSTANTIVE_STATUSES = {"answered", "partial"}
+EVALUATION_STATUSES = SUBSTANTIVE_STATUSES | NO_ANSWER_STATUSES | {"error"}
 PASSAGE_MARKER = re.compile(r"\[(P\d+)\]")
 CITATION_RUN = re.compile(r"\[P\d+\](?:[\s,]*\[P\d+\])*")
 CLAUSE_BREAK = re.compile(r"[;\n]|[!?](?=\s)|(?<!\b\w)(?<!\bул)(?<!\bстр)(?<!\bруб)\.(?=\s)")
@@ -45,23 +47,49 @@ def normalized(text: str) -> str:
 
 def read_cases(path: Path, ids: list[str]) -> list[dict]:
     cases = json.loads(path.read_text(encoding="utf-8-sig"))
-    known = {case["id"] for case in cases}
-    if not cases or len(known) != len(cases):
-        raise ValueError("Набор проверок пуст или содержит повторяющиеся ID.")
-    unknown = set(ids) - known
-    if unknown:
-        raise ValueError(f"Неизвестные ID проверок: {', '.join(sorted(unknown))}")
-    for case in cases:
+    if not isinstance(cases, list) or not cases:
+        raise ValueError("Набор проверок должен быть непустым списком.")
+    for number, case in enumerate(cases):
+        label = case.get("id", number) if isinstance(case, dict) else number
+
+        def require(condition, field):
+            if not condition:
+                raise ValueError(f"Некорректное поле {field} в проверке {label!r}.")
+
+        def strings(value):
+            return isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value)
+
+        require(isinstance(case, dict), "case")
+        for field in ("id", "group", "question"):
+            require(isinstance(case.get(field), str) and case[field].strip(), field)
+        require(isinstance(case.get("evidence"), list), "evidence")
+        for item in case["evidence"]:
+            require(isinstance(item, dict) and all(isinstance(item.get(key), str) and item[key].strip()
+                                                 for key in ("file", "quote")), "evidence")
+        require(strings(case.get("statuses")) and bool(case["statuses"])
+                and set(case["statuses"]) <= EVALUATION_STATUSES, "statuses")
+        require(strings(case.get("must")), "must")
+        require(strings(case.get("must_not", [])), "must_not")
+        for field in ("expected", "pair"):
+            if field in case:
+                require(isinstance(case[field], str), field)
         assertions = case.get("assertions", [])
+        require(isinstance(assertions, list), "assertions")
+        require(isinstance(case.get("cite", []), list), "cite")
         patterns = case["must"] + case.get("must_not", [])
         for item in assertions:
+            require(isinstance(item, dict) and strings(item.get("must"))
+                    and isinstance(item.get("cite"), list), "assertions")
             patterns.extend(item["must"])
             if "subject" in item:
+                require(isinstance(item["subject"], str) and item["subject"].strip(), "assertions.subject")
                 patterns.append(item["subject"])
+            if "same_clause" in item:
+                require(isinstance(item["same_clause"], bool), "assertions.same_clause")
         for pattern in patterns:
             re.compile(pattern)
         indices = [*case.get("cite", []), *(index for item in assertions for index in item["cite"])]
-        if any(not 0 <= index < len(case["evidence"]) for index in indices):
+        if any(type(index) is not int or not 0 <= index < len(case["evidence"]) for index in indices):
             raise ValueError(f"Неверный индекс эталонной ссылки в {case['id']}.")
         if "kb_mutation" in case:
             mutation = case["kb_mutation"]
@@ -70,6 +98,12 @@ def read_cases(path: Path, ids: list[str]) -> list[dict]:
                     or not mutation["old"] or mutation["old"] == mutation["new"]
                     or PurePosixPath(mutation["member"]).suffix.lower() not in {".txt", ".md"}):
                 raise ValueError(f"Некорректное изменение базы в {case['id']}.")
+    known = {case["id"] for case in cases}
+    if len(known) != len(cases):
+        raise ValueError("Набор проверок содержит повторяющиеся ID.")
+    unknown = set(ids) - known
+    if unknown:
+        raise ValueError(f"Неизвестные ID проверок: {', '.join(sorted(unknown))}")
     return [case for case in cases if not ids or case["id"] in ids]
 
 
@@ -136,7 +170,11 @@ def grade_answer(answer, case: dict, slots: list[set[str]], corpus) -> dict:
         and citation.title == corpus.documents[passage.document_id].title
         and citation.quote and citation.quote in passage.text
     ]
-    valid_ids = {citation.id for citation in valid_citations}
+    # CSV only expands markers present in the answer text. A source object kept
+    # in metadata cannot support an answer whose rendered source was lost.
+    rendered_ids = set(PASSAGE_MARKER.findall(answer_text))
+    valid_ids = {citation.id for citation in valid_citations} & rendered_ids
+    dangling_ids = rendered_ids - {citation.id for citation in citations}
     required_cites = case.get("cite", range(len(slots)))
     missing_citations = [index for index in required_cites if not (valid_ids & slots[index])]
     missing_assertions = []
@@ -159,11 +197,12 @@ def grade_answer(answer, case: dict, slots: list[set[str]], corpus) -> dict:
         "status": status,
         "status_ok": status in case["statuses"],
         "unwanted_no_answer": status in NO_ANSWER_STATUSES and status not in case["statuses"],
+        "expected_substantive": bool(SUBSTANTIVE_STATUSES.intersection(case["statuses"])),
         "missing_patterns": missing_patterns,
         "forbidden_patterns": [pattern for pattern in case.get("must_not", []) if re.search(pattern, text)],
         "missing_assertions": missing_assertions,
         "missing_citations": missing_citations,
-        "invalid_citations": len(citations) - len(valid_citations),
+        "invalid_citations": len(citations) - len(valid_citations) + len(dangling_ids),
         "requires_citations": bool(required_cites),
     }
 
@@ -191,6 +230,7 @@ def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[in
     answer_once = getattr(live, "_answer_once", None)
     rankings, contexts = [], []
     initial_answer = None
+    attempts = []
     retry_start = None
     stages = []
     reference_passages = list(dict.fromkeys(
@@ -214,6 +254,7 @@ def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[in
     def capture_answer(*args, **kwargs):
         nonlocal initial_answer
         result = answer_once(*args, **kwargs)
+        attempts.append(result[0])
         if initial_answer is None:
             initial_answer = result[0]
         return result
@@ -222,20 +263,29 @@ def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[in
 
     def capture_chat(system, user, deadline, *, verify=False):
         stage = {"stage": "verify" if verify else "draft"}
-        if not verify:
-            stage["anchors"] = user.get("anchors", {})
-            stage["passages"] = [
-                {"id": p.get("id"), "applicability": p.get("applicability"), "text_visible": bool(p.get("text"))}
-                for p in user.get("passages", [])
-            ]
+        stage["anchors"] = deepcopy(user.get("anchors", {}))
+        stage["passages"] = [
+            {"id": p.get("id"), "applicability": p.get("applicability"), "text_visible": bool(p.get("text"))}
+            for p in user.get("passages", []) if isinstance(p, dict)
+        ]
+        # Explicit payload allowlist: never serialize the gateway/settings object.
+        stage["input"] = {key: deepcopy(user[key]) for key in ("gap", "previous_gap") if key in user}
+        for key in ("claims", "previous_claims"):
+            if isinstance(user.get(key), list):
+                stage["input"][key] = [
+                    {field: deepcopy(claim[field]) for field in ("index", "text", "evidence") if field in claim}
+                    for claim in user[key] if isinstance(claim, dict)
+                ]
         stages.append(stage)
         try:
             result = chat(system, user, deadline, verify=verify)
         except Exception as exc:
             stage["exception_type"] = type(exc).__name__
             raise
-        keys = ("supported", "gap_ok") if verify else ("status", "claims", "gap", "look_for")
-        output = {key: result[key] for key in keys if key in result}
+        keys = ("supported", "gap_ok", "previous_supported", "previous_covered", "adds_information", "consistent") \
+            if verify else ("status", "claims", "gap", "look_for")
+        output = {key: deepcopy(result[key]) for key in keys if key in result} if isinstance(result, dict) else {}
+        stage["output_type"] = type(result).__name__
         if isinstance(output.get("claims"), list):
             output["claims"] = [
                 {key: claim[key] for key in ("text", "evidence") if key in claim}
@@ -267,6 +317,23 @@ def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[in
     initial = grade_answer(initial_answer, case, slots, live.corpus) if initial_answer is not None else None
     ranked = rankings[0] if rankings else []
     retried = len(contexts) > 1
+
+    def rendered_signature(value):
+        return (value.status, value.text, value.citations) if value is not None else None
+
+    decision = "not_attempted"
+    if retried:
+        matches_initial = rendered_signature(answer) == rendered_signature(initial_answer)
+        matches_candidate = len(attempts) > 1 and rendered_signature(answer) == rendered_signature(attempts[-1])
+        decision = ("unchanged" if matches_initial and matches_candidate else "retained_initial" if matches_initial
+                    else "accepted_candidate" if matches_candidate else "reconciled" if answer is not None else "error")
+
+    def attempt_summary(value):
+        review = getattr(value, "retry_review", None)
+        return {"status": value.status, "answer": value.text, "csv_answer": value.csv_text(),
+                "citation_ids": [citation.id for citation in value.citations],
+                "gap": getattr(value, "gap", None), "retry_review": asdict(review) if review is not None else None}
+
     return {
         **grade,
         "reference_context": reference_context,
@@ -286,6 +353,11 @@ def evaluate_live_case(live, case: dict, slots: list[set[str]], cutoffs: list[in
             "ranked_ids": [[p.id for p in ranking] for ranking in rankings],
             "context_ids": [[p.id for p in selection] for selection in contexts],
             "stages": stages,
+            "attempts": [attempt_summary(value) for value in attempts],
+            "retry_decision": {"attempted": retried, "selected": decision,
+                               "initial_status": initial_answer.status if initial_answer is not None else None,
+                               "candidate_status": attempts[-1].status if len(attempts) > 1 else None,
+                               "final_status": answer.status if answer is not None else "error"},
         }} if audit else {}),
     }
 
@@ -437,6 +509,23 @@ def mean_recall(rows: list[list[bool]]) -> float | None:
     return statistics.mean(sum(row) / len(row) for row in rows) if rows else None
 
 
+def selective_metrics(grades: list[dict]) -> dict:
+    """Report fixture failures, not an unmeasured semantic error probability."""
+    substantive = [grade for grade in grades if grade["status"] in SUBSTANTIVE_STATUSES]
+    failed = sum(not passed(grade) for grade in substantive)
+    answerable = [grade for grade in grades if grade.get("expected_substantive", False)]
+    refusals = sum(grade["unwanted_no_answer"] for grade in answerable)
+    return {
+        "live_substantive_answers": len(substantive),
+        "live_answer_coverage": len(substantive) / len(grades) if grades else None,
+        "live_substantive_fixture_failures": failed,
+        "live_substantive_fixture_failure_rate": failed / len(substantive) if substantive else None,
+        "live_answerable_cases": len(answerable),
+        "live_answerable_unwanted_no_answer": refusals,
+        "live_answerable_unwanted_no_answer_rate": refusals / len(answerable) if answerable else None,
+    }
+
+
 def metrics(run: dict, cutoffs: list[int]) -> dict:
     rows = run["cases"]
     with_evidence = [row for row in rows if row["context"]]
@@ -466,6 +555,7 @@ def metrics(run: dict, cutoffs: list[int]) -> dict:
         "median_context_chars": statistics.median(row["context_chars"] for row in rows),
         "median_search_ms": statistics.median(row["search_ms"] for row in rows),
         "live_cases": len(online),
+        **selective_metrics(online),
         "live_status_ok": sum(row["status_ok"] for row in online),
         "live_facts_ok": sum(not row["missing_patterns"] and not row["forbidden_patterns"]
                              and not row["missing_assertions"] for row in online),
@@ -524,6 +614,11 @@ def print_result(label: str, run: dict, cases: list[dict], args: argparse.Namesp
         print(f"  Ожидаемые ссылки с точными цитатами {m['live_supported']}/{m['live_cases_requiring_citations']}, "
               f"технических ошибок {m['live_technical_errors']}, "
               f"неожиданных отказов или уточнений {m['live_unwanted_no_answer']}")
+        print(f"  Доля содержательных ответов {percent(m['live_answer_coverage'])}; "
+              f"не прошли размеченные проверки {m['live_substantive_fixture_failures']}/"
+              f"{m['live_substantive_answers']} ({percent(m['live_substantive_fixture_failure_rate'])}); "
+              f"неожиданные отказы/уточнения на ответимых вопросах "
+              f"{m['live_answerable_unwanted_no_answer']}/{m['live_answerable_cases']}")
         print("  API   " + "   ".join(f"Recall@{k} {percent(m[f'live_recall@{k}'])}" for k in args.k))
         print(f"  Полнота первого контекста API {percent(m['live_context_recall'])}, "
               f"все фрагменты {m['live_context_complete']}/{total}")

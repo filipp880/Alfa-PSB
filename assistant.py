@@ -232,9 +232,12 @@ class LegalAssistant:
             if turn["role"] != "user":
                 continue
             prior = self.corpus.scope(turn["text"])
-            if len(prior.exact_document_ids) == 1:
-                return replace(scope, document_ids=prior.document_ids, exact_document_ids=prior.exact_document_ids)
-            if prior.document_ids or prior.ambiguous_entities:
+            exact = prior.exact_document_ids
+            references = {self.corpus.documents[doc_id].reference for doc_id in exact}
+            if (not prior.ambiguous_entities and not prior.unresolved_references
+                    and (len(exact) == 1 or len(references) == 1 and "" not in references)):
+                return replace(scope, document_ids=exact, exact_document_ids=exact)
+            if prior.document_ids or prior.ambiguous_entities or prior.unresolved_references:
                 break
         return scope
 
@@ -372,12 +375,23 @@ class LegalAssistant:
                     if occurrence := re.search(pattern, passage.text):
                         verbatim = occurrence[0]
                 citations.append(self.citation(passage, verbatim, scope))
-            if len(citations) == len(evidence) and any(
-                self.corpus.applicability(passages[c.id], scope) != "inapplicable" for c in citations
-            ):
-                clean_text = normalize(INLINE_REFERENCE.sub("", text))
-                if clean_text:
-                    claims.append(Claim(clean_text, tuple(citations)))
+            if len(citations) != len(evidence):
+                continue
+            usable = [citation for citation in citations if citation.applicability != "inapplicable"]
+            clean_text = normalize(INLINE_REFERENCE.sub("", text))
+            if not usable or not clean_text:
+                continue
+            if len(usable) < len(citations):
+                # A separate transition rule may establish why an amendment does not apply.
+                # Suppress only a conflicting edition of the same provision when the active one is cited.
+                superseded = {
+                    other.id for citation in usable if citation.applicability == "applicable"
+                    for other in self.corpus.related(passages[citation.id])
+                    if other.document_id != citation.document_id and other.locator == citation.locator
+                }
+                citations = [citation for citation in citations
+                             if citation.applicability != "inapplicable" or citation.id not in superseded]
+            claims.append(Claim(clean_text, tuple(citations)))
         return claims
 
     def ask(self, raw: str, *, deadline: float | None = None) -> Answer:
@@ -469,7 +483,9 @@ class LegalAssistant:
             raw_claims = draft.get("claims")
             if status == "answered" and (not isinstance(raw_claims, list) or not raw_claims):
                 return invalid
-            claims = self.validated_claims(draft, passages, scope) if status in {"answered", "partial", "refusal"} else []
+            claims = self.validated_claims(draft, passages, scope) if status in {
+                "answered", "partial", "insufficient", "refusal"
+            } else []
             raw_gap = draft.get("gap")
             gap = normalize(INLINE_REFERENCE.sub("", raw_gap)) if isinstance(raw_gap, str) and len(raw_gap) <= 420 else ""
             if status not in {"partial", "insufficient", "clarification"}:
@@ -510,7 +526,7 @@ class LegalAssistant:
             return Answer("insufficient", " ".join(filter(None, (INSUFFICIENT, gap))), []), hint
         else:
             intro = ""
-            status = "partial" if rejected or status == "partial" else "answered"
+            status = "partial" if rejected or status in {"partial", "insufficient"} else "answered"
             if rejected and not gap:
                 gap = "Для остальных выводов не нашлось достаточного подтверждения в базе знаний."
 

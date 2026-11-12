@@ -306,7 +306,21 @@ def _date_after(pattern: re.Pattern[str], text: str) -> date | None:
 
 
 def _event_role(left: str, right: str) -> str:
-    if _DOCUMENT_DATE.search(left):
+    if document := _DOCUMENT_DATE.search(left):
+        # A dated specification can follow the contract type without punctuation:
+        # "по договору поставки спецификация от ...". The nearest named object
+        # owns this date; the contract-requisite pattern must not swallow it.
+        specification = list(_SPECIFICATION.finditer(left))
+        if specification and specification[-1].start() > document.start():
+            return "specification"
+        # "Договор от ..." alone is a requisite, but an explicitly requested
+        # signing date ("на дату подписания договора от ...") is an event.
+        # Do not infer signing from an unrelated verb later in the sentence.
+        if re.search(r"\b(?:на|в)\s+(?:дату|день|момент)\s+(?:подписания|заключения)\s*$",
+                     left[:document.start()]):
+            if re.match(r"доп(?:олнительн\w*)?\s*соглашени\w*\b", document[0]):
+                return "amendment_signature"
+            return "signature"
         return "document"
     for clause in (left, right):
         signature = _SIGNATURE.search(clause)

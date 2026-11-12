@@ -65,7 +65,7 @@ class BindingTests(unittest.TestCase):
     def test_address_requires_the_house_and_correct_csv_citation(self):
         case, slots, ids, citations = self.fixture("delivery-amendment-after")
         marker = f"[{ids[0]}]"
-        complete = Answer("answered", f"Химки, ул. Заводская, д. 15, склад № 3. {marker}", citations)
+        complete = Answer("answered", f"Московская область, г. Химки, ул. Заводская, д. 15, склад № 3. {marker}", citations)
         missing = replace(complete, text=complete.text.replace("д. 15, ", ""))
         wrong_locator = replace(complete, citations=[replace(citations[0], locator="п. 0.0")])
         self.assertTrue(passed(grade_answer(complete, case, slots, self.corpus)))

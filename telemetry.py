@@ -20,7 +20,7 @@ _STATUSES = {
     "answered", "partial", "insufficient", "clarification", "out_of_scope", "refusal",
     "error", "offline", "ok", "skipped", "unavailable", "fallback", "disabled", "empty",
     "ready", "timeout", "invalid", "success", "failed", "not_configured",
-    "deadline", "content_filter", "truncated", "invalid_json", "invalid_response",
+    "deadline", "content_filter", "truncated", "interrupted", "network_error", "invalid_json", "invalid_response",
 }
 
 

@@ -167,7 +167,8 @@ _LAW_SEARCH_LABELS = {
 
 
 def _normalize(text: str) -> str:
-    return unicodedata.normalize("NFKC", text).lower().translate(str.maketrans("ё–—−‑", "е----"))
+    # NFKC normalizes the non-breaking hyphen (U+2011) to U+2010.
+    return unicodedata.normalize("NFKC", text).lower().translate(str.maketrans("ё‐‒–—−", "е-----"))
 
 
 def _stem(word: str) -> str:

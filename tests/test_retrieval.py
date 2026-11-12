@@ -31,6 +31,20 @@ class RetrievalTests(unittest.TestCase):
         self.assertTrue(result.text.startswith("2. Обработка персональных данных"))
         self.assertEqual(corpus.scope("ст. 70 ГК РФ").unresolved_references, ("ст. 70 (ГК РФ)",))
 
+    def test_unicode_dashes_preserve_contract_references(self):
+        corpus = self.corpus
+        for dash in "\u2010\u2011\u2012":
+            with self.subTest(dash=dash):
+                query = f"Назовите адрес поставки по П{dash}17/2024 для спецификации от 2 октября 2024."
+                scope = corpus.scope(query)
+                self.assertEqual(len(scope.exact_document_ids), 2)
+                self.assertTrue(all(corpus.documents[doc_id].reference == "п-17/2024"
+                                    for doc_id in scope.exact_document_ids))
+                ranked = corpus.search(query, 4, scope=scope)
+                self.assertIn("изменение п. 3.2", {p.locator for p in ranked})
+                unknown = corpus.scope(f"Кто ремонтирует крышу по договору АР{dash}441/2022?")
+                self.assertEqual(unknown.unresolved_references, ("ар-441/2022",))
+
     def test_scope_preserves_comparison_dates_and_sources(self):
         query = ("Сравните оплату у «Альфа-Трейд» на 28 февраля 2025 и у «Альфа-Трейдинг» на 1 марта 2025.")
         scope = self.corpus.scope(query)

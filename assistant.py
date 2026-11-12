@@ -355,25 +355,23 @@ class LegalAssistant:
                 continue
             citations = []
             for item in evidence:
-                if isinstance(item, str) and item in passages:
-                    passage = passages[item]
-                    citations.append(self.citation(passage, passage.text, scope))
-                    continue
-                if not isinstance(item, dict):
+                if isinstance(item, str):
+                    pid, quote = item, None
+                elif isinstance(item, dict):
+                    pid, quote = item.get("id"), item.get("quote")
+                else:
                     break
-                pid, quote = item.get("id"), item.get("quote")
-                if not isinstance(pid, str) or not isinstance(quote, str) or pid not in passages:
+                if not isinstance(pid, str) or pid not in passages:
                     break
                 passage = passages[pid]
-                wanted = normalize(quote)
-                if not 8 <= len(wanted) <= 1200 or wanted not in normalize(passage.text):
-                    break
-                # Use the verbatim occurrence from the corpus, including its original whitespace.
-                pattern = r"\s+".join(map(re.escape, wanted.split()))
-                occurrence = re.search(pattern, passage.text)
-                if not occurrence:
-                    break
-                citations.append(self.citation(passage, occurrence[0], scope))
+                # The verifier checks the source text for the ID even if an optional quote has a typo.
+                verbatim = passage.text
+                wanted = normalize(quote) if isinstance(quote, str) else ""
+                if 8 <= len(wanted) <= 1200:
+                    pattern = r"\s+".join(map(re.escape, wanted.split()))
+                    if occurrence := re.search(pattern, passage.text):
+                        verbatim = occurrence[0]
+                citations.append(self.citation(passage, verbatim, scope))
             if len(citations) == len(evidence) and any(
                 self.corpus.applicability(passages[c.id], scope) != "inapplicable" for c in citations
             ):
@@ -468,19 +466,18 @@ class LegalAssistant:
                 return invalid
             if status == "out_of_scope":
                 return Answer(status, "Я отвечаю на юридические вопросы по предоставленной базе знаний.", []), ""
+            raw_claims = draft.get("claims")
+            if status == "answered" and (not isinstance(raw_claims, list) or not raw_claims):
+                return invalid
             claims = self.validated_claims(draft, passages, scope) if status in {"answered", "partial", "refusal"} else []
             raw_gap = draft.get("gap")
             gap = normalize(INLINE_REFERENCE.sub("", raw_gap)) if isinstance(raw_gap, str) and len(raw_gap) <= 420 else ""
             if status not in {"partial", "insufficient", "clarification"}:
                 gap = ""
             if claims or gap:
-                cited = list(dict.fromkeys(c.id for claim in claims for c in claim.citations))
-                related = {other.id for pid in cited for other in self.corpus.related(passages[pid])}
-                review_ids = set(cited) | related | {p.id for p in selected[:7]}
                 with span("assistant.check", kind="GUARDRAIL") as trace:
                     review = self.gateway.chat(VERIFY, {
                         **prompt,
-                        "passages": [item for item in prompt["passages"] if item["id"] in review_ids],
                         "claims": [
                             {"index": i, "text": claim.text, "evidence": [c.id for c in claim.citations]}
                             for i, claim in enumerate(claims)
@@ -500,7 +497,6 @@ class LegalAssistant:
             LOG.warning("Ответ сервиса модели недоступен: %s", exc)
             return invalid
 
-        raw_claims = draft.get("claims")
         rejected = len(retained) != len(raw_claims) if isinstance(raw_claims, list) else True
         look_for = draft.get("look_for")
         hint = normalize(look_for) if isinstance(look_for, str) and 2 <= len(look_for) <= 160 else ""

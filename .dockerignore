@@ -1,0 +1,12 @@
+*
+!Dockerfile
+!assistant.py
+!corpus.py
+!proxy.py
+!solution.py
+!web.py
+!requirements.txt
+!static/
+!static/**
+!data/
+!data/knowledge-base.zip

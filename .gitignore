@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+submission.csv
+questions.csv
+data/demo_*.csv
+dist/*
+!dist/submission.zip
+tmp/
+~$*

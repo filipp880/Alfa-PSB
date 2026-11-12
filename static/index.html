@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Юридический ассистент · ПСБ</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail" aria-label="Навигация">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name"><strong>ПСБ</strong><span>Юридический ассистент</span></span>
+      </div>
+      <div class="rail-actions">
+        <button class="new-chat" id="new-chat" type="button">
+          <span class="icon icon-plus" aria-hidden="true"></span><span>Новый диалог</span>
+        </button>
+        <button class="documents-link" id="open-library" type="button" aria-haspopup="dialog">
+          <span class="icon icon-book" aria-hidden="true"></span><span>База документов</span>
+        </button>
+      </div>
+      <div class="rail-footer" id="library-count"></div>
+    </aside>
+
+    <main class="workspace" aria-labelledby="workspace-title">
+      <header class="workspace-bar">
+        <h1 id="workspace-title">Юридический ассистент</h1>
+        <span class="runtime-mode" id="runtime-mode" hidden>Локальный поиск</span>
+      </header>
+
+      <div class="history-scroll" id="history-scroll">
+        <section class="welcome" id="welcome" aria-labelledby="welcome-title">
+          <span class="welcome-mark" aria-hidden="true"><span class="icon icon-book"></span></span>
+          <h2 id="welcome-title">Какой вопрос нужно разобрать?</h2>
+          <p>Задайте вопрос по закону, договору или внутреннему документу. Источники можно открыть прямо из ответа.</p>
+          <div class="suggestions" aria-label="Примеры вопросов">
+            <button type="button" data-question="До какого числа нужно вносить арендную плату по договору с ООО «Северный Склад»?">
+              <span><strong>Условия договора</strong><span>Срок внесения арендной платы</span></span>
+              <span class="arrow" aria-hidden="true">↗</span>
+            </button>
+            <button type="button" data-question="Какой максимальный срок испытания можно установить главному бухгалтеру?">
+              <span><strong>Трудовое право</strong><span>Испытательный срок главбуха</span></span>
+              <span class="arrow" aria-hidden="true">↗</span>
+            </button>
+            <button type="button" data-question="В августе 2024 года мы заключили договор на 12 млн рублей. Нужно ли было одобрение генерального директора?">
+              <span><strong>Редакция на дату</strong><span>Порядок одобрения в августе 2024</span></span>
+              <span class="arrow" aria-hidden="true">↗</span>
+            </button>
+          </div>
+        </section>
+        <section class="messages" id="messages" role="log" aria-label="История диалога" aria-live="polite" aria-relevant="additions text"></section>
+      </div>
+
+      <div class="composer-area">
+        <form class="composer" id="composer">
+          <label class="sr-only" for="question">Ваш вопрос</label>
+          <textarea id="question" name="question" rows="1" maxlength="8000" placeholder="Введите вопрос о документе или норме" required></textarea>
+          <button class="send" id="send" type="submit" aria-label="Отправить вопрос" title="Отправить вопрос" disabled>
+            <span aria-hidden="true">↑</span>
+          </button>
+        </form>
+        <p class="composer-help" id="composer-help">Enter — отправить · Shift + Enter — новая строка</p>
+      </div>
+    </main>
+  </div>
+
+  <dialog class="library" id="library" aria-labelledby="library-title">
+    <div class="library-frame">
+      <header class="library-bar">
+        <h2 id="library-title">База документов</h2>
+        <button class="icon-button" id="close-library" type="button" aria-label="Закрыть базу документов" title="Закрыть">
+          <span aria-hidden="true">×</span>
+        </button>
+      </header>
+      <section class="library-index" id="library-index">
+        <label for="document-search">Поиск по названию или номеру</label>
+        <input id="document-search" type="search" autocomplete="off" placeholder="Например, 152-ФЗ">
+        <p class="library-notice" id="library-notice" role="status" hidden></p>
+        <ul class="document-list" id="document-list" aria-label="Документы базы"></ul>
+      </section>
+      <section class="document-view" id="document-view" aria-labelledby="document-title" hidden>
+        <button class="back-button" id="back-to-library" type="button">← Все документы</button>
+        <h3 id="document-title" tabindex="-1"></h3>
+        <p class="document-filename" id="document-filename"></p>
+        <p class="document-location" id="document-location" hidden></p>
+        <div class="document-text" id="document-text"></div>
+      </section>
+    </div>
+  </dialog>
+</body>
+</html>

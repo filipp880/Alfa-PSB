@@ -1,0 +1,21 @@
+name: alfa-psb
+services:
+  assistant:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      LLM_BASE_URL: "${LLM_BASE_URL:-}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_MODEL: "${LLM_MODEL:-}"
+      EMB_MODEL: "${EMB_MODEL:-baai/bge-m3}"
+      RERANKER_MODEL: "${RERANKER_MODEL:-}"
+      EMBEDDER_API_KEY: "${EMBEDDER_API_KEY:-}"
+      RERANKER_API_KEY: "${RERANKER_API_KEY:-}"
+      MAX_TOKENS: "${MAX_TOKENS:-1500}"
+      MAX_WORKERS: "${MAX_WORKERS:-6}"
+      TEMPERATURE: "${TEMPERATURE:-0}"
+      TOP_K: "${TOP_K:-18}"
+      RERANKER_TOP_N: "${RERANKER_TOP_N:-10}"
+      LLM_JSON_MODE: "${LLM_JSON_MODE:-0}"
+      OFFLINE: "${OFFLINE:-0}"

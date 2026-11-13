@@ -83,11 +83,14 @@
         <ul class="document-list" id="document-list" aria-label="Документы базы"></ul>
       </section>
       <section class="document-view" id="document-view" aria-labelledby="document-title" hidden>
-        <button class="back-button" id="back-to-library" type="button">← Все документы</button>
-        <h3 id="document-title" tabindex="-1"></h3>
-        <p class="document-filename" id="document-filename"></p>
-        <p class="document-location" id="document-location" hidden></p>
-        <div class="document-text" id="document-text"></div>
+        <div class="document-heading">
+          <button class="back-button" id="back-to-library" type="button">← Все документы</button>
+          <h3 id="document-title" tabindex="-1"></h3>
+          <p class="document-filename" id="document-filename"></p>
+          <p class="document-location" id="document-location" hidden></p>
+          <div class="document-edition" id="document-edition"></div>
+        </div>
+        <div class="document-text" id="document-text" role="region" aria-label="Полный текст документа" tabindex="0"></div>
       </section>
     </div>
   </dialog>

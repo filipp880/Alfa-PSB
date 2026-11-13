@@ -1,8 +1,11 @@
 from datetime import date
 from pathlib import Path
+from shutil import copyfile
+from tempfile import TemporaryDirectory
 import unittest
+from zipfile import ZipFile
 
-from corpus import load_corpus
+from corpus import INDEX_FILENAME, build_prebuilt_index, date_mentions, legal_references, load_corpus
 
 
 class RetrievalTests(unittest.TestCase):
@@ -152,6 +155,110 @@ class RetrievalTests(unittest.TestCase):
         target = next(p for p in items if "на срок до двух месяцев" in p.text)
         self.assertEqual(corpus.neighbors(target)[0], lead)
         self.assertTrue(all(p.document_id == lead.document_id for p in items))
+
+    def test_number_first_contract_reference_and_missing_clause(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "knowledge-base.zip"
+            with ZipFile(path, "w") as archive:
+                archive.writestr("Договор поставки Ромашка.txt", "\n".join((
+                    "ДОГОВОР ПОСТАВКИ № 12-Д", "ООО «Ромашка» — Поставщик.", "1. Сроки поставки",
+                    "1.1. Срок — 3 рабочих дня.", "1.2. Поставка после предоплаты.",
+                )))
+                archive.writestr("Договор поставки Ромашка Плюс.txt", "\n".join((
+                    "ДОГОВОР ПОСТАВКИ № 13-Д", "ООО «Ромашка Плюс» — Поставщик.", "1. Сроки поставки",
+                    "1.1. Срок — 5 календарных дней.", "1.2. Поставка после подписания.",
+                )))
+            corpus = load_corpus(path)
+        query = "Что сказано о сроке по п. 1.1 договора № 12-Д?"
+        top = corpus.search(query, 1)[0]
+        self.assertEqual(top.locator, "п. 1.1")
+        self.assertIn("3 рабочих дня", top.text)
+        self.assertEqual(corpus.scope(query).unresolved_references, ())
+        self.assertEqual(corpus.scope("Что требует п. 9.9 договора № 12-Д?").unresolved_references, ("п. 9.9",))
+        self.assertEqual(corpus.scope("Какой срок у ООО Ромашка Плюс?").candidate_entities, ("Ромашка Плюс",))
+        self.assertEqual(corpus.scope("Сравните сроки Ромашки и Ромашки Плюс").candidate_entities,
+                         ("Ромашка", "Ромашка Плюс"))
+
+    def test_typed_references_are_pinned_for_context(self):
+        corpus = self.corpus
+        query = "Что содержит приложение № 1 письма К-12?"
+        scope = corpus.scope(query)
+        self.assertEqual(corpus.exact_passages(scope, corpus.search(query))[0].locator, "Приложение 1")
+        self.assertIn("ред 2025", corpus.documents[corpus.scope("По приказу № 14-П").exact_document_ids[0]].title)
+        self.assertEqual(legal_references("Примените подп. 2.8-1 и раздел IV приказа № 14-П"),
+                         (("subpoint", "2.8-1"), ("section", "iv"), ("order", "14-п")))
+        self.assertEqual([value for _, _, value in date_mentions("п. 5.3.12, редакция от 01.03.24")],
+                         [date(2024, 3, 1)])
+
+    def test_dialogue_disambiguates_ordinal_and_keeps_uncertain_candidates(self):
+        history = [{"role": "user", "text": "Сравните договоры № П-17/2024 и № ПТ-05/2023."},
+                   {"role": "assistant", "text": "Продолжим по договору А-08/2024."}]
+        scope, enriched = self.corpus.dialogue_scope("А для второго договора?", history)
+        self.assertEqual({self.corpus.documents[doc_id].reference for doc_id in scope.exact_document_ids}, {"пт-05/2023"})
+        self.assertNotIn("П-17/2024", enriched)
+        scope, _ = self.corpus.dialogue_scope("А по нему какой срок?", history)
+        self.assertEqual({self.corpus.documents[doc_id].reference for doc_id in scope.document_ids},
+                         {"п-17/2024", "пт-05/2023"})
+        self.assertTrue(scope.ambiguous_documents)
+        scope, enriched = self.corpus.dialogue_scope("А по нему какой срок?", [])
+        self.assertFalse(scope.document_ids)
+        self.assertEqual(enriched, "А по нему какой срок?")
+
+    def test_dialogue_infers_date_without_reusing_the_later_value(self):
+        history = [{"role": "user", "text": "Куда везти по П-17/2024 спецификацию от 2 октября 2024?"}]
+        for question, start in (("А если дата была раньше?", date.min), ("А если 1 октября?", date(2024, 10, 1))):
+            with self.subTest(question=question):
+                scope, _ = self.corpus.dialogue_scope(question, history)
+                self.assertEqual(scope.date_ranges, ((start, date(2024, 10, 1)),))
+                self.assertEqual(scope.event_role, "specification")
+
+    def test_current_and_historical_context_keep_distinct_text(self):
+        old, current = [next(p for p in self.corpus.passages.values() if p.locator == "п. 3.1" and
+                             f"ред {year}" in self.corpus.documents[p.document_id].title) for year in (2023, 2025)]
+        self.assertNotEqual(self.corpus.context_key(old), self.corpus.context_key(current))
+        scope = self.corpus.scope("Как оформляют согласование по п. 3.1?")
+        self.assertFalse(self.corpus.include_in_context(old, scope))
+        self.assertTrue(self.corpus.include_in_context(current, scope))
+        scope = self.corpus.scope("Как оформляли согласование в прежней редакции п. 3.1?")
+        self.assertTrue(self.corpus.include_in_context(old, scope))
+
+    def test_addendum_changes_only_the_numbered_specification(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "knowledge-base.zip"
+            with ZipFile(path, "w") as archive:
+                archive.writestr("Договор поставки.txt", "Договор поставки № 12-Д\n1. Сроки\n1.1. Срок поставки — 5 дней.")
+                archive.writestr("Доп соглашение № 1.txt", "Дополнительное соглашение № 1\nк договору № 12-Д\n"
+                                  "Изложить пункт 1.1 договора в следующей редакции: срок — 3 рабочих дня.\n"
+                                  "Изменение применяется только к спецификации № 7.")
+                archive.writestr("Спецификация № 8.txt", "Спецификация № 8\nк договору № 12-Д\n1. Товар\n1.1. Мебель.")
+            corpus = load_corpus(path)
+        base, amendment = [next(p for p in corpus.passages.values() if p.locator == locator)
+                           for locator in ("п. 1.1", "изменение п. 1.1")]
+        for suffix, expected in (("по спецификации № 7", ("inapplicable", "applicable")),
+                                 ("по спецификации № 8", ("applicable", "inapplicable")),
+                                 ("", ("unknown", "unknown"))):
+            with self.subTest(suffix=suffix):
+                scope = corpus.scope(f"Какой срок по договору № 12-Д {suffix}?")
+                self.assertEqual(tuple(corpus.applicability(p, scope) for p in (base, amendment)), expected)
+
+    def test_prebuilt_index_replays_retrieval_and_rebuilds_after_changes(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "knowledge-base.zip"
+            copyfile(Path(__file__).resolve().parents[1] / "data" / "knowledge-base.zip", path)
+            index = path.with_name(INDEX_FILENAME)
+            index.write_bytes(build_prebuilt_index(path))
+            prebuilt = load_corpus(path, embedding_model="BAAI/bge-m3")
+            self.assertTrue(prebuilt.prebuilt)
+            self.assertEqual(prebuilt.documents, self.corpus.documents)
+            self.assertEqual(prebuilt.passages, self.corpus.passages)
+            query = "Что требуется по приложению № 1 письма К-12?"
+            self.assertEqual(prebuilt.search(query), self.corpus.search(query))
+            self.assertFalse(load_corpus(path, embedding_model="other-model").prebuilt)
+            with ZipFile(path, "a") as archive:
+                archive.writestr("приказ.txt", "ПРИКАЗ № 1\nДата\nУтверждено\nДействует с 01.01.2024.")
+            self.assertFalse(load_corpus(path).prebuilt)
+            index.write_bytes(build_prebuilt_index(path).replace("Утверждено".encode(), "Испорчено".encode()))
+            self.assertFalse(load_corpus(path).prebuilt)
 
 
 if __name__ == "__main__":

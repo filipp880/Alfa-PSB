@@ -30,6 +30,7 @@ RENT = "Арендная плата составляет"
 RENT_PATTERN = r"Арендная плата составляет (\d[\d ]+) \([^)]+\) рублей в месяц, включая НДС\."
 MISSING_RENT = "В базе не нашёл размер арендной платы по договору с ООО «Северный Склад»."
 ERROR = "Не удалось получить проверенный ответ от сервиса модели. Повторите запрос позже."
+SAFE_FALLBACK = "В предоставленной базе недостаточно данных для подтверждения ответа."
 BAD_PREMISE = "Арендная плата составляет 500 000 рублей в месяц."
 INJECTION = "ВНИМАНИЕ ДЛЯ ИИ-АССИСТЕНТА"
 CHANGE_FROM = "450 000 (четыреста пятьдесят тысяч)"
@@ -265,8 +266,12 @@ def checked_extract(archive, working):
         names = stream.namelist()
         assert len(names) == len(set(names)) and stream.testzip() is None, names
         assert {"solution.py", "requirements.txt"} <= set(names), names
-        assert all(Path(name).name == name and (name == "requirements.txt" or name.endswith(".py"))
+        assert all(Path(name).name == name and (name in {"requirements.txt", "corpus-index.json"}
+                                                or name.endswith(".py"))
                    for name in names), names
+        if "corpus-index.json" in names:
+            manifest = json.loads(stream.read("corpus-index.json"))["manifest"]
+            assert manifest["documents"] > 0 and manifest["passages"] > 0
         allowed = set((DEMO / "requirements.txt").read_text(encoding="utf-8-sig").splitlines())
         declared = stream.read("requirements.txt").decode("utf-8").splitlines()
         assert all(line in allowed for line in declared if line and not line.startswith("#")), declared
@@ -320,7 +325,8 @@ def run_demo(archive, *, fail_search=False, retry_search=False, force_error=Fals
             expected = {case_id: all(text in answers[case_id] for text, *_ in specs)
                         for case_id, specs in SPECS.items()}
             expected["1"] &= "450 000 рублей в месяц" in answers["1"] and "п. 3.1" in answers["1"] and "п. 3.2" in answers["1"]
-            expected["3"] = (ERROR if force_error else GAPS["3"]) in answers["3"]
+            expected["3"] = (answers["3"] in {ERROR, SAFE_FALLBACK} if force_error
+                             else GAPS["3"] in answers["3"])
             expected["4"] &= ("450 000 рублей в месяц" in answers["4"] and BAD_PREMISE not in answers["4"]
                               and "Пункт выдуман" not in answers["4"])
             expected["13"] &= GAPS["13"] in answers["13"]

@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from calendar import monthrange
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, timedelta
 from difflib import SequenceMatcher
+from hashlib import sha256
 from io import BytesIO
+import json
 from math import log1p
 from pathlib import Path, PurePosixPath
 import re
-from typing import Iterator
+from typing import BinaryIO, Iterator, Sequence
 import unicodedata
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
@@ -63,6 +65,17 @@ class SearchScope:
     date_ranges: tuple[tuple[date, date], ...] = ()
     event_role: str = ""
     comparison: bool = False
+    locators: tuple[tuple[str, str], ...] = ()
+    article_provisions: tuple[tuple[str, str, str], ...] = ()
+    ambiguous_documents: tuple[str, ...] = ()
+    historical: bool = False
+    specifications: tuple[str, ...] = ()
+
+
+INDEX_FILENAME = "corpus-index.json"
+_INDEX_VERSION = 1
+_FRAGMENT_LIMIT = 1350
+_INDEX_LIMIT = 64 * 1024 * 1024
 
 
 _MONTHS = "янв фев мар апр ма июн июл авг сен окт ноя дек".split()
@@ -76,6 +89,7 @@ _DATE = re.compile(
     re.IGNORECASE,
 )
 _ISO_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_SHORT_DATE = re.compile(r"(?<![\d.])(\d{1,2})\.(\d{1,2})\.(\d{2})(?![\d.])")
 _DATE_WITHOUT_YEAR = re.compile(
     rf"\b(?P<day>\d{{1,2}})\s+(?P<month>{_MONTH_PATTERN})\b"
     r"|(?<![\d./-])(?P<number>\d{1,2})[./](?P<numeric_month>\d{1,2})(?![\d./-])",
@@ -94,8 +108,29 @@ _DOCUMENT_DATE = re.compile(
     rf"(?:\s+[а-яa-z]+){{0,3}}\s+(?:(?:no\s*)?{_ID.pattern}\s+|no\s*[а-яa-z\d/-]+\s+)?от\s*$"
 )
 _ARTICLE = re.compile(r"\b(?:стать(?:я|и|е|ю|ей|ями|ях|ям)|ст\.?)\s*(\d+(?:\.\d+)*)", re.I)
-_POINT = re.compile(r"\b(?:пункт\w*|част[ьи]|п\.|ч\.)\s*(\d+(?:\.\d+)*)", re.I)
-_NUMBER_TAIL = re.compile(r"\s*(?:,\s*|\b(?:и|или)\s+)(\d+(?:\.\d+)*)(?![\d./-])", re.I)
+_POINT = re.compile(r"\b(?:пункт\w*|пп?\.)\s*(\d+(?:\.\d+)*(?:-\d+)?)(?![\d-]|\.\d)", re.I)
+_PART = re.compile(r"\b(?:част(?:ь|и|ью|ями|ях|ям)|ч\.)\s*(\d+(?:\.\d+)*(?:-\d+)?)(?![\d-]|\.\d)", re.I)
+_SUBPOINT = re.compile(r"\b(?:подпункт\w*|подп\.)\s*['«\"]?(\d+(?:\.\d+)*(?:-\d+)?|[а-я])(?![\w.-])", re.I)
+_SECTION = re.compile(r"\bраздел\w*\s*(?:no\s*)?(\d+(?:\.\d+)*|[ivxlcdm]+)\b", re.I)
+_APPENDIX = re.compile(r"\bприложени\w*\s*(?:no\s*)?(\d+(?:\.\d+)*)\b", re.I)
+_DOCUMENT_TYPES = (
+    ("contract", r"договор\w*|контракт\w*"),
+    ("amendment", r"допсоглашени\w*|доп(?:олнительн\w*|\.)?\s*соглашени\w*"),
+    ("specification", r"спецификаци\w*"),
+    ("order", r"приказ\w*"),
+    ("letter", r"письм\w*"),
+    ("note", r"(?:служебн\w*\s+)?записк\w*"),
+    ("regulation", r"регламент\w*"),
+)
+_DOCUMENT_NUMBER = re.compile(
+    r"\b(?:" + "|".join(f"(?P<{kind}>{pattern})" for kind, pattern in _DOCUMENT_TYPES) + r")"
+    r"(?:[ \t]+(?!по\b|от\b|к\b|no\b|договор\b|пункт\b)[а-яa-z]+){0,3}[ \t]+"
+    r"(?:no\s*|номер\s+|n\s*)"
+    r"(?P<number>(?:[а-яa-z]{1,8}\s*-\s*)?\d{1,12}(?:\s*[-/]\s*[а-яa-z\d]{1,12}){0,2})(?![\w/-])", re.I,
+)
+_LOCATORS = (("article", _ARTICLE), ("point", _POINT), ("part", _PART), ("subpoint", _SUBPOINT),
+             ("section", _SECTION), ("appendix", _APPENDIX))
+_NUMBER_TAIL = re.compile(r"\s*(?:,\s*|\b(?:и|или)\s+)(\d+(?:\.\d+)*(?:-\d+)?)(?![\d/-]|\.\d)", re.I)
 _ARTICLE_FAMILY = re.compile(
     r"\b(?P<tk>тк(?:\s+рф)?|трудов\w*\s+кодекс\w*)\b|"
     r"\b(?P<nk>нк(?:\s+рф)?|налогов\w*\s+кодекс\w*)\b|"
@@ -106,9 +141,25 @@ _ARTICLE_FAMILY = re.compile(
 )
 _FAMILY_NAMES = {"tk": "ТК РФ", "nk": "НК РФ", "koap": "КоАП РФ", "gk": "ГК РФ", "uk": "УК РФ"}
 _LEGAL_ENTITY = re.compile(r"\b(?:ооо|ао|пао|зао|оао)\s*[«\"“]([^»\"”\n]{2,80})[»\"”]", re.I)
+_PARTY_DEFINITION = re.compile(
+    r"\b(?:ООО|АО|ПАО|ЗАО|ОАО)\s*[«\"“]([^»\"”\n]{2,80})[»\"”]"
+    r"[^.\n]{0,120}?\(?(?:именуем\w*\s+в\s+дальнейшем\s+)?[«\"“]([^»\"”\n]{2,40})[»\"”]", re.I,
+)
+_ABBREVIATION = re.compile(
+    r"(?P<phrase>[А-Яа-яЁё][А-Яа-яЁё -]{4,110})\s*\(\s*(?:далее\s*[—–-]?\s*)?[«\"]?(?P<short>[А-ЯЁ]{2,8})[»\"]?\s*\)"
+)
+_CONTINUATION = re.compile(
+    r"^\s*(?:а\s|да[.,\s]|и\s|тогда\s)|\b(?:по\s+(?:нему|ней|ним)|"
+    r"(?:этот|этому|этого|этой|этом)\s+(?:договор\w*|документ\w*|регламент\w*|контрагент\w*|записк\w*|письм\w*)|именно)\b", re.I,
+)
+_ORDINAL_CONTRACT = re.compile(r"\b(перв\w*|втор\w*|трет\w*)\s+(?:договор\w*|контракт\w*)\b", re.I)
+_EARLIER_DATE = re.compile(r"\b(?:дат\w*|событи\w*|подписа\w*)\b[^.!?]{0,35}\bраньше\b", re.I)
+_HISTORICAL = re.compile(r"\b(?:историческ\w*|прежн\w*|стар\w*|предыдущ\w*|утративш\w*\s+силу)\s+редакци\w*", re.I)
 _LOCATOR_POINT = re.compile(r"\b(?:п|ч)\.\s*(\d+(?:\.\d+)*(?:-\d+)?)\b", re.I)
 _LOCAL_POINT_LIST = re.compile(r"\bпункт\w*\s+([\d.,\s]+(?:и\s+\d+(?:\.\d+)*)?)\s+настоящей\s+статьи", re.I)
 _AMENDMENT_DATE = re.compile(r"\bспецификаци\w*[^.!?\n]{0,90}?подписан\w*\s+после\s+", re.I)
+_AMENDMENT_SCOPE = re.compile(r"\b(?:применя(?:ется|ются)|распространя(?:ется|ются))\s+(?:только\s+)?"
+                              r"(?:к|на)\s+спецификаци\w*[^.!?\n]{0,120}", re.I)
 _DATE_COMPARISON = re.compile(r"\b(?:сравн\w*|сопостав\w*|раньше\s+и\s+теперь|до\s+и\s+после)\b", re.I)
 _DATE_CLAUSE = re.compile(r"[!?;\n]|\.(?=\s)")
 _SIGNATURE = re.compile(r"\b(?:подпи[сш]\w*|заключ(?:ил\w*|а\w*|ен\w*|ить|ат)|заключени[яе]\s+договор\w*)\b")
@@ -121,8 +172,10 @@ _AMOUNT = re.compile(r"\b(\d{1,3}(?:\s\d{3}){1,5})(?=\s*(?:\(|руб))|\b(\d{1,1
 _LAW_FILE = re.compile(r"^(.+?)_ст(\d+(?:\.\d+)*)", re.I)
 _CLAUSE = re.compile(r"^[«\"]?(\d+(?:\.\d+)+(?:-\d+)?)\.\s+|^(\d+)\.\s+")
 _SUBCLAUSE = re.compile(r"^(\d+(?:\.\d+)*(?:-\d+)?|[а-я])\)\s+", re.I)
-_REVISION = re.compile(r"\b(?:действует\s+с|редакция\s+от|вступает\s+в\s+силу\s+с)\s+", re.I)
-_EXPIRES = re.compile(r"\bутратил[ао]?\s+силу\s+с\s+", re.I)
+_EFFECTIVE_START = re.compile(r"\b(?:действует\s+с|вступа(?:ет|ют)\s+в\s+силу\s+с|дата\s+вступления\s+в\s+силу\s*[:—-]?)\s+", re.I)
+_REVISION = re.compile(r"\bредакци(?:я|и)\s+от\s+", re.I)
+_EXPIRES = re.compile(r"\b(?:утрати[лт][ао]?\s+силу\s+с|прекраща(?:ет|ется)\s+действие\s+с)\s+", re.I)
+_VALID_THROUGH = re.compile(r"\bдействует\b[^\n]{0,60}?\b(по|до)\s+", re.I)
 _LAW_CHANGE = re.compile(
     r"^(?P<scope>Статья|Часть|Пункт|Подпункт|Абзац|Примечания?)\s+"
     r"(?:(?P<number>\d+(?:\.\d+)*(?:-\d+)?)\s+)?[^:;]{0,80}?"
@@ -168,6 +221,8 @@ _ALIASES = (
     ("возврат", "возвращает", "возвращать"),
     ("гендиректор", "генеральный директор"),
     ("юротдел", "юридический отдел"),
+    ("СЭД", "система электронного документооборота"),
+    ("ДОУ", "документооборот", "документационное обеспечение управления"),
     ("оформить", "оформление", "оформляется"),
     ("скан", "сканированная копия", "скан-копия"),
     ("размещение", "размещаются", "разместить"),
@@ -211,8 +266,8 @@ def _tokens(text: str) -> Counter[str]:
     tokens = Counter(_words(normalized))
     tokens.update(f"ref:{_reference(match)}" for match in _ID.finditer(normalized))
     tokens.update(f"entity:{entity}" for entity in _ENTITY.findall(normalized))
-    tokens.update(f"article:{value}" for value in _ARTICLE.findall(normalized))
-    tokens.update(f"point:{value}" for value in _POINT.findall(normalized))
+    tokens.update(f"{kind}:{value}" for kind, value in _locator_mentions(normalized))
+    tokens.update(f"number:{kind}:{value}" for kind, value in _document_number_mentions(normalized))
     tokens.update(f"rate:{value.replace(',', '.')}" for value in _RATE.findall(normalized))
     for separated, short, scale in _AMOUNT.findall(normalized):
         amount = int(re.sub(r"\s", "", separated)) if separated else int(short) * (1_000_000 if scale == "млн" else 1_000)
@@ -223,7 +278,7 @@ def _tokens(text: str) -> Counter[str]:
 _SEARCH_ALIASES = tuple(tuple(tuple(_words(alias)) for alias in group) for group in _ALIASES)
 
 
-def _query_terms(text: str) -> dict[str, float]:
+def _query_terms(text: str, aliases: dict[str, tuple[str, ...]]) -> dict[str, float]:
     exact = _tokens(text)
     weighted = {token: 1.0 for token in exact}
     for group in _SEARCH_ALIASES:
@@ -231,6 +286,14 @@ def _query_terms(text: str) -> dict[str, float]:
             for alias in group:
                 for token in alias:
                     weighted.setdefault(token, 0.53)
+    for short, phrase in aliases.items():
+        short_terms = _words(short)
+        if short_terms and all(term in exact for term in short_terms):
+            for term in phrase:
+                weighted.setdefault(term, 0.62)
+        elif phrase and all(term in exact for term in phrase):
+            for term in short_terms:
+                weighted.setdefault(term, 0.62)
     return weighted
 
 
@@ -241,12 +304,40 @@ def _reference(match: re.Match[str]) -> str:
     return f"{prefix}-{number}/{year}" if year else f"{prefix}-{number}"
 
 
+def _numbered_documents(normalized: str) -> Iterator[tuple[int, str, str]]:
+    for match in _DOCUMENT_NUMBER.finditer(normalized):
+        kind = next(kind for kind, _ in _DOCUMENT_TYPES if match[kind] is not None)
+        number = re.sub(r"\s+", "", match["number"])
+        yield match.start(), kind, _reference(prefix) if (prefix := _ID.fullmatch(number)) else number
+
+
+def _document_number_mentions(normalized: str) -> Iterator[tuple[str, str]]:
+    for _, kind, number in _numbered_documents(normalized):
+        yield kind, number
+
+
+def _locator_mentions(normalized: str) -> Iterator[tuple[str, str]]:
+    for kind, pattern in _LOCATORS:
+        for value, _, _ in _number_groups(pattern, normalized):
+            yield kind, value
+
+
+def legal_references(text: str) -> tuple[tuple[str, str], ...]:
+    """Return typed numbers as written, with spacing and hyphens normalized."""
+    normalized = _normalize(text)
+    numbers = tuple(_document_number_mentions(normalized))
+    typed = {value for _, value in numbers}
+    bare = [("document", value) for match in _ID.finditer(normalized)
+            if (value := _reference(match)) not in typed]
+    return tuple(dict.fromkeys((*_locator_mentions(normalized), *numbers, *bare)))
+
+
 def _month_number(text: str) -> int:
     month = text.lower()
     return next(index for index, root in enumerate(_MONTHS, 1) if month.startswith(root))
 
 
-def _date_mentions(text: str) -> list[tuple[int, int, date]]:
+def date_mentions(text: str) -> list[tuple[int, int, date]]:
     values = []
     for match in _DATE.finditer(text):
         try:
@@ -262,11 +353,21 @@ def _date_mentions(text: str) -> list[tuple[int, int, date]]:
             values.append((match.start(), match.end(), date(*(int(part) for part in match.groups()))))
         except ValueError:
             continue
+    for match in _SHORT_DATE.finditer(text):
+        # Three dotted numbers are also a valid clause number after a locator.
+        if re.search(r"\b(?:пункт\w*|подпункт\w*|раздел\w*|пп?\.|подп\.|ч\.|ст\.)\s*$",
+                     text[max(0, match.start() - 24):match.start()], re.I):
+            continue
+        day, month, year = map(int, match.groups())
+        try:
+            values.append((match.start(), match.end(), date(year + 2000, month, day)))
+        except ValueError:
+            continue
     return sorted(values)
 
 
 def _query_date_mentions(text: str, default_year: int | None) -> list[tuple[int, int, date]]:
-    values = _date_mentions(text)
+    values = date_mentions(text)
     years = {value.year for _, _, value in values}
     year = next(iter(years)) if len(years) == 1 else default_year if not years else None
     if year is not None:
@@ -296,13 +397,13 @@ def _query_date_mentions(text: str, default_year: int | None) -> list[tuple[int,
 
 
 def _first_date(text: str) -> date | None:
-    mentions = _date_mentions(text)
+    mentions = date_mentions(text)
     return mentions[0][2] if mentions else None
 
 
 def _date_after(pattern: re.Pattern[str], text: str) -> date | None:
     match = pattern.search(text)
-    return _first_date(text[match.end():]) if match else None
+    return _first_date(text[match.end():].split("\n", 1)[0][:55]) if match else None
 
 
 def _event_role(left: str, right: str) -> str:
@@ -475,17 +576,31 @@ def _make_document(doc_id: str, filename: str, text: str) -> Document:
         return Document(doc_id, title, text, filename, "law", url, snapshot)
 
     title = short_name
-    edition_lines = [line for line in lines[:6] if _REVISION.search(line) or _EXPIRES.search(line)]
+    edition_lines = [line for line in lines[:6] if any(pattern.search(line) for pattern in
+                     (_EFFECTIVE_START, _REVISION, _EXPIRES, _VALID_THROUGH))]
+    edition_source = "\n".join(edition_lines)
     edition_note = " ".join(edition_lines)
-    effective_from = _date_after(_REVISION, edition_note)
-    effective_to = _date_after(_EXPIRES, edition_note)
-    first_reference = next(_ID.finditer(_normalize("\n".join(lines[:4]))), None)
+    effective_from = _date_after(_EFFECTIVE_START, edition_source) or _date_after(_REVISION, edition_source)
+    effective_to = _date_after(_EXPIRES, edition_source)
+    if not effective_to and (through := _VALID_THROUGH.search(edition_source)):
+        effective_to = _date_after(_VALID_THROUGH, edition_source)
+        if effective_to and effective_to < date.max and (
+            through[1].lower() == "по" or "включительно" in edition_source[through.end():through.end() + 30].lower()
+        ):
+            effective_to += timedelta(days=1)
+    header = _normalize("\n".join(lines[:4]))
+    first_reference = _ID.search(header)
     reference = _reference(first_reference) if first_reference else ""
     effective_event = ""
     if short_name.lower().startswith("договор") and (contract := _ID.search(lines[0])):
         title = _ID.sub(lambda _: "№ " + contract[0], title, count=1)
     elif short_name.lower().startswith("доп соглашение"):
         title = " ".join(lines[:2])
+    title_numbers = list(_document_number_mentions(_normalize(title))) or list(_document_number_mentions(header))
+    primary_kind = title_numbers[0][0] if title_numbers else ""
+    reference_kind = "contract" if primary_kind == "amendment" else primary_kind
+    if reference_kind in {"contract", "letter", "note", "specification"}:
+        reference = next((number for kind, number in title_numbers if kind == reference_kind), reference)
     if short_name.lower().startswith("письмо"):
         if operative := next((line for line in lines if re.match(r"^С\s+\d", line)), ""):
             effective_from = _first_date(operative) or effective_from
@@ -500,7 +615,7 @@ def _lines(document: Document) -> list[str]:
     return [line.strip() for line in document.text.splitlines() if line.strip() and not _ASSISTANT_COMMAND.match(line)]
 
 
-def _fragments(text: str, limit: int = 1350) -> list[str]:
+def _fragments(text: str, limit: int = _FRAGMENT_LIMIT) -> list[str]:
     pieces = []
     while len(text) > limit:
         boundary = text.rfind("\n", limit // 2, limit + 1)
@@ -517,16 +632,19 @@ def _fragments(text: str, limit: int = 1350) -> list[str]:
 
 def _corporate_parts(document: Document) -> Iterator[tuple[str, str, str, date | None, str]]:
     lines = _lines(document)
-    if document.title.lower().startswith("дополнительное соглашение"):
+    if re.match(r"доп(?:олнительн\w*|\.)?\s*соглашени\w*", document.title, re.I):
         changed = re.search(r"\bизложить\s+пункт\s+(\d+(?:\.\d+)+)", document.text, re.I)
         locator = f"изменение п. {changed[1]}" if changed else "дополнительное соглашение"
         yield locator, "Условия изменения договора", "\n".join(lines), None, ""
         return
     if not any(re.match(r"^\d+\.\d+\.\s+", line) for line in lines):
         for index, line in enumerate(lines, 1):
-            if index <= 3 or line.startswith(("Руководитель ", "Начальник ")):
+            clause = _CLAUSE.match(line)
+            appendix = _APPENDIX.match(_normalize(line))
+            if (index <= 3 and not (clause or appendix)) or line.startswith(("Руководитель ", "Начальник ")):
                 continue
-            locator = "Приложение 1" if line.startswith("Приложение 1.") else f"абзац «{_lead(line)}»"
+            locator = (f"Приложение {appendix[1]}" if appendix else f"п. {clause[1] or clause[2]}" if clause
+                       else f"абзац «{_lead(line)}»")
             yield locator, "", line, _first_date(line) if re.match(r"^С\s+\d", line) else None, ""
         return
 
@@ -534,11 +652,16 @@ def _corporate_parts(document: Document) -> Iterator[tuple[str, str, str, date |
     locator = "преамбула"
     pending = []
     for line in lines:
-        if match := _CLAUSE.match(line):
+        match = _CLAUSE.match(line)
+        appendix = _APPENDIX.match(_normalize(line))
+        if match or appendix:
             if pending:
                 yield locator, heading, "\n".join(pending), None, ""
             pending = []
-            if match[1]:
+            if appendix:
+                heading = locator = f"Приложение {appendix[1]}"
+                pending.append(line)
+            elif match[1]:
                 locator = f"п. {match[1]}"
                 pending.append(line)
             else:
@@ -635,12 +758,19 @@ def _document_tokens(document: Document) -> Counter[str]:
 
 
 class Corpus:
-    def __init__(self, documents: dict[str, Document], passages: dict[str, Passage]) -> None:
+    def __init__(self, documents: dict[str, Document], passages: dict[str, Passage], *,
+                 token_index: dict[str, dict[str, Counter[str]]] | None = None) -> None:
         self.documents = documents
         self.passages = passages
-        self._body = {key: _tokens(passage.text) for key, passage in passages.items()}
-        self._headings = {key: _tokens(f"{passage.heading} {passage.locator}") for key, passage in passages.items()}
-        self._titles = {key: _document_tokens(document) for key, document in documents.items()}
+        self.prebuilt = token_index is not None
+        if token_index is None:
+            token_index = {
+                "body": {key: _tokens(passage.text) for key, passage in passages.items()},
+                "headings": {key: _tokens(f"{passage.heading} {passage.locator}") for key, passage in passages.items()},
+                "titles": {key: _document_tokens(document) for key, document in documents.items()},
+            }
+        self._body, self._headings, self._titles = (token_index[name] for name in ("body", "headings", "titles"))
+        self._token_index = token_index
         self._length = {key: sum(terms.values()) for key, terms in self._body.items()}
         self._average_length = max(1.0, sum(self._length.values()) / len(passages))
         frequencies = Counter(token for terms in self._body.values() for token in terms)
@@ -650,10 +780,13 @@ class Corpus:
         for passage in passages.values():
             self._by_document[passage.document_id].append(passage)
         self._references = defaultdict(list)
+        self._document_numbers = defaultdict(list)
         self._articles = defaultdict(list)
         self._article_families = {}
         self._organizations = defaultdict(list)
         self._org_names = {}
+        abbreviations = defaultdict(set)
+        self._party_aliases = defaultdict(dict)
         for doc in documents.values():
             if doc.reference:
                 self._references[doc.reference].append(doc.id)
@@ -670,11 +803,34 @@ class Corpus:
                 self._articles["", number[1]].append(doc.id)
             if doc.kind == "corporate":
                 title = _org_key(doc.title)
+                header = _normalize("\n".join(doc.text.splitlines()[:6]))
+                approval = "\n".join(line for line in header.splitlines()
+                                     if re.match(r"\s*(?:приказ\b|утвержден\w*\s+приказом\b)", line))
+                own_numbers = list(_document_number_mentions(_normalize(doc.title)))
+                own_numbers.extend((kind, number) for kind, number in _document_number_mentions(header) if kind != "order")
+                own_numbers.extend((kind, number) for kind, number in _document_number_mentions(approval) if kind == "order")
+                if doc.reference:
+                    primary = next((kind for kind, pattern in _DOCUMENT_TYPES if re.match(pattern, title)), "")
+                    if primary and primary != "amendment":
+                        own_numbers.append((primary, doc.reference))
+                for kind, number in dict.fromkeys(own_numbers):
+                    self._document_numbers[kind, number].append(doc.id)
+                    short = number.split("/", 1)[0]
+                    if short != number:
+                        self._document_numbers[kind, short].append(doc.id)
+                for name, party in _PARTY_DEFINITION.findall(doc.text[:1800]):
+                    self._party_aliases[doc.id][_org_key(party)] = name
                 for name in _LEGAL_ENTITY.findall(doc.text[:1800]):
                     org = _org_key(name)
                     if re.search(rf"(?<!\w){re.escape(org)}(?!\w)", title):
                         self._organizations[org].append(doc.id)
                         self._org_names[org] = name
+            for match in _ABBREVIATION.finditer(doc.text):
+                short = match["short"]
+                words = match["phrase"].split()[-len(short):]
+                if len(words) == len(short) and "".join(word[0].upper() for word in words) == short:
+                    abbreviations[short].add(tuple(_words(" ".join(words))))
+        self._aliases = {short: next(iter(phrases)) for short, phrases in abbreviations.items() if len(phrases) == 1}
         self._by_position = {passage.id: position for items in self._by_document.values()
                              for position, passage in enumerate(items)}
         self._list_members = {}
@@ -700,26 +856,47 @@ class Corpus:
                     for member in members:
                         self._list_leads.setdefault(member.id, lead)
         self._sections = defaultdict(list)
+        self._edition_versions = defaultdict(list)
+        self._locator_keys = {}
         self._amendments = defaultdict(list)
         self._amendment_dates = {}
+        self._amendment_specifications = {}
         for passage in passages.values():
+            locator = _normalize(passage.locator.split("абзац «", 1)[0])
+            self._locator_keys[passage.id] = frozenset(_locator_mentions(locator))
+            document = documents[passage.document_id]
+            if document.edition_note and document.effective_from:
+                self._edition_versions[self._edition_family(document), locator].append(passage)
             point = _LOCATOR_POINT.search(passage.locator)
             if point:
                 self._sections[passage.document_id, point[1]].append(passage)
             if point and passage.locator.startswith("изменение"):
-                if boundary := _date_after(_AMENDMENT_DATE, passage.text):
+                if boundary := _date_after(_AMENDMENT_DATE, document.text):
                     self._amendment_dates[passage.id] = boundary
-                    doc = self.documents[passage.document_id]
-                    self._amendments[doc.reference, point[1]].append(boundary)
+                if restriction := _AMENDMENT_SCOPE.search(document.text):
+                    ids = {number for kind, number in _document_number_mentions(_normalize(restriction[0]))
+                           if kind == "specification"}
+                    if ids:
+                        self._amendment_specifications[passage.id] = ids
+                if document.reference and (passage.id in self._amendment_dates or passage.id in self._amendment_specifications):
+                    self._amendments[document.reference, point[1]].append(passage.id)
 
     def _organization_matches(self, query: str) -> tuple[set[str], set[str], set[str]]:
         query_words = _org_key(query).split()
         words = tuple(_stem(word) for word in query_words)
-        exact, typo, ambiguous = set(), set(), set()
+        spans = []
         for org in self._organizations:
             tokens = _org_stem(org)
-            if any(words[start:start + len(tokens)] == tokens for start in range(len(words) - len(tokens) + 1)):
-                exact.add(org)
+            for start in range(len(words) - len(tokens) + 1):
+                end = start + len(tokens)
+                if words[start:end] == tokens:
+                    spans.append((start, end, org))
+        # Keep standalone occurrences of both names even when one is a prefix of the other.
+        exact = {org for start, end, org in spans if not any(
+            outer_start <= start and end <= outer_end and end - start < outer_end - outer_start
+            for outer_start, outer_end, _ in spans
+        )}
+        typo, ambiguous = set(), set()
         candidates = {_org_key(name) for name in (*_ORG_QUOTE.findall(query), *_ENTITY.findall(query))}
         if not exact:
             for org in self._organizations:
@@ -756,12 +933,26 @@ class Corpus:
     def scope(self, query: str, *, default_year: int | None = None) -> SearchScope:
         normalized = _normalize(query)
         exact_docs, inferred_docs, ref_docs, unresolved = [], [], [], []
+        document_numbers = list(_numbered_documents(normalized))
+        typed_numbers = {number for _, _, number in document_numbers}
         for match in _ID.finditer(normalized):
             reference = _reference(match)
-            if ids := self._references.get(reference):
+            if reference in typed_numbers:
+                continue
+            if (reference in self._references or match[3]
+                or re.search(r"(?:\bno\s*|договор\w*\s+)$", normalized[max(0, match.start() - 22):match.start()])):
+                document_numbers.append((match.start(), "document", reference))
+        labels = {"contract": "договор", "amendment": "дополнительное соглашение", "specification": "спецификация",
+                  "order": "приказ", "letter": "письмо", "note": "записка", "regulation": "регламент"}
+        for _, kind, number in sorted(document_numbers):
+            ids = self._references.get(number) if kind == "document" else self._document_numbers.get((kind, number))
+            if ids:
                 ref_docs.extend(ids)
-            elif match[3] or re.search(r"(?:\bno\s*|договор\w*\s+)$", normalized[max(0, match.start() - 22):match.start()]):
-                unresolved.append(reference)
+            elif kind == "specification" and any(number in values for values in self._amendment_specifications.values()):
+                # A scope condition in an addendum can identify the specification without its full text.
+                continue
+            else:
+                unresolved.append(number if kind == "document" or _ID.fullmatch(number) else f"{labels[kind]} № {number}")
         exact_docs.extend(ref_docs)
         for number, start, end in _number_groups(_ARTICLE, normalized):
             family = _family_near(normalized, start, end)
@@ -780,32 +971,131 @@ class Corpus:
         exact_docs.extend(doc_id for org in sorted(exact_org) for doc_id in self._organizations[org])
         inferred_docs.extend(doc_id for org in sorted(typo_org | ambiguous_org) for doc_id in self._organizations[org])
         ranges, role, comparison = _event_dates(query, default_year)
+        locators = tuple(dict.fromkeys(_locator_mentions(normalized)))
+        points = tuple(dict.fromkeys(value for kind, value in locators if kind in {"point", "part"}))
+        article_provisions = []
+        for match in _ARTICLE.finditer(normalized):
+            prefix = normalized[max(0, match.start() - 40):match.start()]
+            nearby = [(kind, value) for kind, pattern in _LOCATORS if kind in {"point", "part", "subpoint"}
+                      for value, _, end in _number_groups(pattern, prefix)
+                      if not re.search(r"[!;?]|\b(?:если|поскольку|по|стать\w*)\b|ст\.", prefix[end:])]
+            family = _family_near(normalized, *match.span())
+            article_provisions.extend((doc_id, kind, value) for doc_id in self._articles.get((family, match[1]), ())
+                                      for kind, value in nearby)
+        precise = {(kind, value) for kind, value in locators if kind != "article"}
+        if precise and not any(kind == "article" for kind, _ in locators) and len({
+            self.documents[doc_id].reference or self._edition_family(self.documents[doc_id]) for doc_id in ref_docs
+        }) == 1:
+            available = {key for doc_id in ref_docs for p in self._by_document[doc_id] for key in self._locator_keys[p.id]}
+            marker = {"point": "п.", "part": "ч.", "subpoint": "подп.", "section": "раздел", "appendix": "приложение"}
+            unresolved.extend(f"{marker[kind]} {value}" for kind, value in locators
+                              if (kind, value) in precise and (kind, value) not in available)
         return SearchScope(
             document_ids=tuple(dict.fromkeys(exact_docs + inferred_docs)),
             exact_document_ids=tuple(dict.fromkeys(exact_docs)),
             candidate_entities=tuple(self._org_names[org] for org in sorted(exact_org | typo_org | ambiguous_org)),
             ambiguous_entities=tuple(self._org_names[org] for org in sorted(ambiguous_org)),
             unresolved_references=tuple(dict.fromkeys(unresolved)),
-            points=tuple(dict.fromkeys(number for number, _, _ in _number_groups(_POINT, normalized))),
+            points=points,
             date_ranges=ranges, event_role=role, comparison=comparison,
+            locators=locators, article_provisions=tuple(dict.fromkeys(article_provisions)),
+            historical=bool(_HISTORICAL.search(normalized)),
+            specifications=tuple(dict.fromkeys(number for _, kind, number in sorted(document_numbers)
+                                                if kind == "specification")),
         )
+
+    def dialogue_scope(self, question: str, history: Sequence[dict[str, str]]) -> tuple[SearchScope, str]:
+        """Resolve follow-ups from the preceding user turns of this dialogue."""
+        scope = self.scope(question)
+        if (not _CONTINUATION.search(question) and not _ORDINAL_CONTRACT.search(question)
+            or scope.unresolved_references or scope.ambiguous_entities):
+            return scope, question
+        prior_turns = []
+        for turn in reversed(history[-8:]):
+            if turn.get("role") != "user" or not (text := turn.get("text")):
+                continue
+            prior = self.scope(text)
+            if prior.unresolved_references:
+                break
+            if scope.document_ids and prior.document_ids and not set(scope.document_ids) & set(prior.document_ids):
+                break
+            prior_turns.append((text, prior))
+            if prior.document_ids or not _CONTINUATION.search(text):
+                break
+        if not prior_turns:
+            return scope, question
+
+        _, owner = prior_turns[-1]
+        inferred = []
+        if not scope.document_ids and owner.document_ids:
+            groups = defaultdict(list)
+            for doc_id in owner.document_ids:
+                document = self.documents[doc_id]
+                groups[document.reference or self._edition_family(document)].append(doc_id)
+            selected = list(groups.values())
+            ordinal = _ORDINAL_CONTRACT.search(question)
+            if ordinal:
+                index = 0 if ordinal[1].lower().startswith("перв") else 1 if ordinal[1].lower().startswith("втор") else 2
+                # Apply ordinal selection only to contracts explicitly named in the earlier turn.
+                contracts = [ids for ids in selected if any(
+                    self.documents[doc_id].title.casefold().startswith("договор") for doc_id in ids
+                )]
+                if len(contracts) > index:
+                    selected = [contracts[index]]
+                elif len(contracts) > 1:
+                    selected = contracts
+            ids = tuple(doc_id for group in selected for doc_id in group)
+            ambiguous = len(selected) > 1 or bool(owner.ambiguous_entities)
+            exact = tuple(doc_id for doc_id in ids if doc_id in owner.exact_document_ids) if not ambiguous else ()
+            names = tuple(self.documents[doc_id].title for doc_id in ids)
+            scope = replace(scope, document_ids=ids, exact_document_ids=exact,
+                            candidate_entities=owner.candidate_entities if ambiguous or len(groups) == 1 else (),
+                            ambiguous_entities=owner.ambiguous_entities,
+                            ambiguous_documents=names if ambiguous else ())
+            if not ambiguous and not scope.specifications:
+                scope = replace(scope, specifications=owner.specifications)
+            inferred.extend(names)
+            if ordinal and not ambiguous and len(groups) > 1:
+                # Avoid giving the query from both contracts more weight than the selected one.
+                prior_turns[-1] = ("", owner)
+
+        temporal = next((item for _, item in prior_turns if item.date_ranges and item.event_role != "document"), None)
+        if temporal is not None and not temporal.comparison and not scope.comparison and len(temporal.date_ranges) == 1:
+            start, end = temporal.date_ranges[0]
+            if not scope.date_ranges:
+                dated = self.scope(question, default_year=start.year) if start.year == end.year else scope
+                ranges = dated.date_ranges
+                if not ranges:
+                    ranges = ((date.min, start - timedelta(days=1)),) if _EARLIER_DATE.search(question) and start > date.min else temporal.date_ranges
+                scope = replace(scope, date_ranges=ranges, event_role=dated.event_role or temporal.event_role,
+                                comparison=dated.comparison)
+            elif not scope.event_role:
+                scope = replace(scope, event_role=temporal.event_role)
+        extra = [*inferred, *(text for text, _ in reversed(prior_turns) if text)]
+        return scope, "\n".join((question, *extra))
 
     def applicability(self, passage: Passage, scope: SearchScope) -> str:
         """Assess whether the corpus has an explicit temporal boundary for this evidence."""
         if scope.comparison:
             return "comparison"
+        document = self.documents[passage.document_id]
+        point = _LOCATOR_POINT.search(passage.locator)
+        if point and (amendments := self._amendments.get((document.reference, point[1]))):
+            if passage.id in amendments:
+                condition = self._amendment_applicability(passage.id, scope)
+                if condition is not None:
+                    return condition
+            elif not passage.locator.startswith("изменение"):
+                conditions = [self._amendment_applicability(pid, scope) for pid in amendments]
+                if "applicable" in conditions:
+                    return "inapplicable"
+                if all(condition == "inapplicable" for condition in conditions):
+                    return "applicable"
         if len(scope.date_ranges) != 1 or scope.event_role == "document":
             return "unknown"
         start, end = scope.date_ranges[0]
-        document = self.documents[passage.document_id]
         if document.effective_event and scope.event_role not in {"", document.effective_event}:
             return "unknown"
-        if scope.event_role == "specification":
-            if boundary := self._amendment_dates.get(passage.id):
-                return "inapplicable" if end <= boundary else "applicable" if start > boundary else "unknown"
-            point = _LOCATOR_POINT.search(passage.locator)
-            if point and (amendments := self._amendments.get((document.reference, point[1]))):
-                return "inapplicable" if start > min(amendments) else "applicable" if end <= min(amendments) else "unknown"
         effective = passage.effective_from or document.effective_from
         expires = document.effective_to
         if (effective and end < effective) or (expires and start >= expires):
@@ -815,6 +1105,99 @@ class Corpus:
         if document.snapshot_date and end > document.snapshot_date:
             return "unknown"
         return "applicable" if effective or expires else "unknown"
+
+    def _amendment_applicability(self, pid: str, scope: SearchScope) -> str | None:
+        conditions = []
+        if specifications := self._amendment_specifications.get(pid):
+            requested = set(scope.specifications)
+            if requested and requested <= specifications:
+                conditions.append("applicable")
+            elif requested and not requested & specifications:
+                conditions.append("inapplicable")
+            else:
+                conditions.append("unknown")
+        if boundary := self._amendment_dates.get(pid):
+            if scope.event_role == "specification" and len(scope.date_ranges) == 1:
+                start, end = scope.date_ranges[0]
+                conditions.append("inapplicable" if end <= boundary else "applicable" if start > boundary else "unknown")
+            else:
+                conditions.append("unknown")
+        if not conditions:
+            return None
+        if "inapplicable" in conditions:
+            return "inapplicable"
+        return "unknown" if "unknown" in conditions else "applicable"
+
+    def include_in_context(self, passage: Passage, scope: SearchScope) -> bool:
+        """Keep competing current variants and exclude a superseded copy when its replacement is known."""
+        if scope.comparison or scope.historical:
+            return True
+        status = self.applicability(passage, scope)
+        if status == "inapplicable":
+            # Preserve the explicitly requested text for a qualified answer about its inapplicability.
+            return passage.document_id in scope.exact_document_ids
+        document = self.documents[passage.document_id]
+        if scope.date_ranges or not document.effective_to or passage.document_id in scope.exact_document_ids:
+            return True
+        locator = _normalize(passage.locator.split("абзац «", 1)[0])
+        versions = self._edition_versions[self._edition_family(document), locator]
+        return not any(other.document_id != passage.document_id and not self.documents[other.document_id].effective_to
+                       and self.documents[other.document_id].effective_from == document.effective_to for other in versions)
+
+    @staticmethod
+    def _edition_family(document: Document) -> str:
+        title = _normalize(document.title)
+        return re.split(r"\s+ред(?:акци\w*)?\.?\s+", title, maxsplit=1)[0].strip()
+
+    def context_key(self, passage: Passage) -> tuple:
+        """Identify duplicated provisions while preserving distinct text and editions."""
+        doc = self.documents[passage.document_id]
+        return (self._edition_family(doc), doc.reference, passage.locator.casefold(),
+                passage.effective_from or doc.effective_from, doc.effective_to, doc.effective_event,
+                doc.snapshot_date, passage.edition_note or doc.edition_note,
+                " ".join(_normalize(passage.text).split()))
+
+    def _requested_keys(self, passage: Passage, scope: SearchScope) -> set[tuple[str, str]]:
+        specialized = {(kind, value) for kind, value in scope.locators if kind != "article"}
+        if not specialized and scope.points:
+            specialized = {("point", value) for value in scope.points} | {("part", value) for value in scope.points}
+        if scope.article_provisions and self.documents[passage.document_id].kind == "law":
+            specialized = {(kind, value) for doc_id, kind, value in scope.article_provisions if doc_id == passage.document_id}
+        return specialized or set(scope.locators)
+
+    def exact_passages(self, scope: SearchScope, ranked: Sequence[Passage], limit: int = 3) -> list[Passage]:
+        """Keep explicit provision openers ahead of semantically similar candidates."""
+        if limit <= 0:
+            return []
+        ids = set(scope.exact_document_ids or scope.document_ids)
+        has_locators = scope.locators or scope.points
+        if not ids and (not has_locators or scope.unresolved_references):
+            return []
+        found = {}
+        for passage in ranked:
+            if (ids and passage.document_id not in ids) or self.applicability(passage, scope) == "inapplicable":
+                continue
+            if not scope.date_ranges and not scope.historical and self.documents[passage.document_id].effective_to:
+                continue
+            wanted = self._requested_keys(passage, scope)
+            keys = self._locator_keys[passage.id] & wanted
+            if wanted and not keys:
+                continue
+            if "абзац «" in passage.locator or "примечание о применении" in passage.locator:
+                if keys and all(kind in {"point", "part", "article"} for kind, _ in keys):
+                    continue
+            identity = (passage.document_id, keys)
+            found.setdefault(identity, passage)
+        result = sorted(found.values(), key=lambda passage: (
+            not any(kind != "article" for kind, _ in self._requested_keys(passage, scope)),
+            self.applicability(passage, scope) == "unknown" and bool(scope.date_ranges),
+        ))
+        if not has_locators:
+            # If there is one named document, its strongest context candidates can still be pinned.
+            result.extend(p for p in ranked if p.document_id in ids and p not in result
+                          and self.applicability(p, scope) != "inapplicable"
+                          and (scope.date_ranges or scope.historical or not self.documents[p.document_id].effective_to))
+        return result[:limit]
 
     def _section_start(self, doc_id: str, number: str) -> list[Passage]:
         section = self._sections.get((doc_id, number), [])
@@ -913,7 +1296,7 @@ class Corpus:
         return [item for item in dict.fromkeys(result) if item != passage][:8]
 
     def search(self, query: str, limit: int = 24, *, scope: SearchScope | None = None) -> list[Passage]:
-        terms = _query_terms(query)
+        terms = _query_terms(query, self._aliases)
         if limit <= 0:
             return []
         scope = scope if scope is not None else self.scope(query)
@@ -924,7 +1307,7 @@ class Corpus:
         generic_rate = _RATE_QUERY.search(normalized)
         payment_deadline = _PAYMENT_DEADLINE.search(normalized)
         entities = tuple(_ORG_QUOTE.findall(normalized))
-        query_entities = {token for token in terms if token.startswith(("entity:", "ref:", "article:"))}
+        query_entities = {token for token in terms if token.startswith(("entity:", "ref:", "article:", "number:"))}
         exact_ids = set(scope.exact_document_ids)
         scope_ids = set(scope.document_ids)
         document_scores = {}
@@ -934,11 +1317,14 @@ class Corpus:
                           for token, weight in terms.items() if token in title)
             overlaps = query_entities & title.keys()
             if scope.unresolved_references and key not in scope_ids:
-                overlaps = {token for token in overlaps if not token.startswith(("article:", "ref:"))}
+                overlaps = {token for token in overlaps if not token.startswith(("article:", "ref:", "number:"))}
             exact = len(overlaps) * 4.0
             document_title = _normalize(document.title)
             exact += 4.0 * sum(bool(re.search(rf"(?<!\w){re.escape(entity)}(?!\w)", document_title))
                                for entity in entities)
+            aliases = self._party_aliases.get(key, {})
+            if key in scope_ids and aliases:
+                exact += sum(1.0 for alias in aliases if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", normalized))
             anchor_bonus = 7.0 if key in exact_ids else 4.5 if key in scope_ids else 0.0
             document_scores[key] = min(12.0, overlap * 0.67) + exact + anchor_bonus
 
@@ -967,11 +1353,14 @@ class Corpus:
                     score += 5.0
             document = self.documents[passage.document_id]
             title_score = document_scores[passage.document_id]
-            if scope.points and (not scope_ids or passage.document_id in scope_ids):
-                point = _LOCATOR_POINT.search(passage.locator)
-                if point and point[1] in scope.points:
-                    score += 18.0 if passage in self._section_start(passage.document_id, point[1]) else 10.0
-            factor = 0.65 if document.effective_to and not scope.date_ranges and not scope.comparison else 1.0
+            if (scope.locators or scope.points) and (not scope_ids or passage.document_id in scope_ids):
+                matched = self._locator_keys[key] & self._requested_keys(passage, scope)
+                if any(kind != "article" for kind, _ in matched):
+                    is_opening = "абзац «" not in passage.locator and "примечание о применении" not in passage.locator
+                    score += 24.0 if is_opening else 10.0
+            factor = 1.0
+            if document.effective_to and not scope.date_ranges and not scope.comparison:
+                factor = 1.22 if scope.historical else 0.65
             if document.kind == "corporate" and scope.date_ranges:
                 temporal = self.applicability(passage, scope)
                 factor = {"inapplicable": 0.58, "applicable": 1.25}.get(temporal, 1.0)
@@ -979,12 +1368,13 @@ class Corpus:
                 scores.append(((score + title_score) * factor, key))
         scores.sort(key=lambda item: -item[0])
         ranked = [self.passages[key] for _, key in scores]
+        pins = self.exact_passages(scope, ranked, limit=min(3, limit)) if scope.locators else []
         if not scope_ids:
-            return ranked[:limit]
+            return list(dict.fromkeys(pins + ranked))[:limit]
         anchored = [item for item in ranked if item.document_id in scope_ids]
         outside = [item for item in ranked if item.document_id not in scope_ids]
         # Start with the strongest exact hit and keep candidates from each explicit source.
-        best = anchored[:1]
+        best = pins + anchored[:1]
         if len(scope_ids) > 1 and limit >= 4:
             by_document = {}
             for item in anchored:
@@ -995,8 +1385,7 @@ class Corpus:
         return (preferred + outside + [item for item in anchored if item not in preferred])[:limit]
 
 
-def load_corpus(path: Path) -> Corpus:
-    """Read documents without extracting archive members to the filesystem."""
+def _parse_corpus(path: Path) -> Corpus:
     documents = {}
     passages = {}
     with ZipFile(path) as archive:
@@ -1022,3 +1411,92 @@ def load_corpus(path: Path) -> Corpus:
     if not passages:
         raise ValueError("В архиве базы знаний нет читаемых положений.")
     return Corpus(documents, passages)
+
+
+def _archive_hash(path: Path) -> str:
+    with path.open("rb") as stream:
+        return _sha256_file(stream)
+
+
+def _sha256_file(stream: BinaryIO) -> str:
+    digest = sha256()
+    for block in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(block)
+    return digest.hexdigest()
+
+
+def _json_bytes(data: object) -> bytes:
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"),
+                      default=lambda value: value.isoformat()).encode("utf-8")
+
+
+def build_prebuilt_index(path: Path, *, embedding_model: str = "baai/bge-m3") -> bytes:
+    """Build portable BM25 data; embedding credentials are unnecessary."""
+    source_hash = _archive_hash(path)
+    corpus = _parse_corpus(path)
+    payload = {
+        "documents": [asdict(document) for document in corpus.documents.values()],
+        "passages": [asdict(passage) for passage in corpus.passages.values()],
+        "tokens": corpus._token_index,
+    }
+    manifest = {
+        "source_sha256": source_hash,
+        "documents": len(corpus.documents),
+        "passages": len(corpus.passages),
+        "chunking": {"mode": "legal_provisions", "fragment_limit": _FRAGMENT_LIMIT},
+        "embedding_model": embedding_model.strip().casefold(),
+        "version": _INDEX_VERSION,
+        "payload_sha256": sha256(_json_bytes(payload)).hexdigest(),
+    }
+    return _json_bytes({"manifest": manifest, "data": payload})
+
+
+def _with_dates(record: dict, fields: tuple[str, ...]) -> dict:
+    for key in fields:
+        if record.get(key) is not None:
+            record[key] = date.fromisoformat(record[key])
+    return record
+
+
+def _read_prebuilt_index(index_path: Path, source_hash: str, embedding_model: str | None) -> Corpus | None:
+    try:
+        if not 0 < index_path.stat().st_size <= _INDEX_LIMIT:
+            return None
+        contents = json.loads(index_path.read_bytes())
+        manifest = contents["manifest"]
+        if (manifest["source_sha256"] != source_hash or manifest["version"] != _INDEX_VERSION
+            or manifest["chunking"] != {"mode": "legal_provisions", "fragment_limit": _FRAGMENT_LIMIT}
+            or (embedding_model is not None and manifest["embedding_model"] != embedding_model.strip().casefold())):
+            return None
+        data = contents["data"]
+        if sha256(_json_bytes(data)).hexdigest() != manifest["payload_sha256"]:
+            return None
+        documents = {item["id"]: Document(**_with_dates(item, ("snapshot_date", "effective_from", "effective_to")))
+                     for item in data["documents"]}
+        passages = {item["id"]: Passage(**_with_dates(item, ("effective_from",))) for item in data["passages"]}
+        if (not passages or len(documents) != manifest["documents"] or len(passages) != manifest["passages"]
+            or len(documents) != len(data["documents"]) or len(passages) != len(data["passages"])
+            or any(passage.document_id not in documents for passage in passages.values())):
+            return None
+        tokens = data["tokens"]
+        for key, records in (("body", passages), ("headings", passages), ("titles", documents)):
+            if tokens[key].keys() != records.keys():
+                return None
+            if any(not isinstance(term, str) or type(count) is not int or count < 1
+                   for counts in tokens[key].values() for term, count in counts.items()):
+                return None
+        return Corpus(documents, passages, token_index=tokens)
+    except (OSError, AttributeError, TypeError, ValueError, KeyError, IndexError, RecursionError):
+        return None
+
+
+def load_corpus(path: Path, *, embedding_model: str | None = None) -> Corpus:
+    """Read the archive or a matching prebuilt index without extracting members."""
+    candidates = (path.with_name(INDEX_FILENAME), Path(__file__).resolve().with_name(INDEX_FILENAME))
+    prebuilt_paths = [candidate for candidate in dict.fromkeys(candidates) if candidate.is_file()]
+    if prebuilt_paths:
+        source_hash = _archive_hash(path)
+        for candidate in prebuilt_paths:
+            if corpus := _read_prebuilt_index(candidate, source_hash, embedding_model):
+                return corpus
+    return _parse_corpus(path)

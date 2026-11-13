@@ -312,7 +312,7 @@ class SystemTests(unittest.TestCase):
         gateway = Gateway(Settings(key="fixture", model="fixture"))
         payloads = []
 
-        def post(endpoint, key, payload, deadline, timeout, *, retry=False):
+        def post(endpoint, key, payload, deadline, timeout, *, retry=False, attempts=None):
             payloads.append(set(payload))
             if len(payloads) == 1:
                 raise GatewayError(endpoint, 422)
@@ -369,7 +369,7 @@ class SystemTests(unittest.TestCase):
                 self.assertIn("п. 3.1", rows[1][1])
                 self.assertNotIn("500 000", rows[1][1])
                 self.assertNotIn("выдуман", rows[1][1])
-                self.assertIn("недостаточно подтверждений", rows[2][1])
+                self.assertIn("недостаточно данных", rows[2][1])
                 self.assertGreater(server.requests["/embeddings"], 2)
                 self.assertEqual(server.requests["/rerank"], 2)
                 self.assertEqual(server.requests["/chat/completions"], 3)

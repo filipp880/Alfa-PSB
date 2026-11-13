@@ -17,22 +17,30 @@ const documentTitle = element("document-title");
 const documentText = element("document-text");
 const documentLocation = element("document-location");
 const documentFilename = element("document-filename");
+const documentEdition = element("document-edition");
 
 const answerStatuses = {
-  partial: "Частичный ответ",
+  answered: "Подтверждено",
+  partial: "Частично подтверждено",
   insufficient: "Недостаточно данных",
   clarification: "Нужно уточнение",
   out_of_scope: "Вне базы знаний",
-  refusal: "Ответ ограничен",
+  refusal: "Отказ по основаниям",
   error: "Ошибка сервиса",
   offline: "Локальный поиск",
 };
 
 const editionStatuses = {
-  applicable: "Действует на запрошенную дату",
-  inapplicable: "За пределами срока действия",
+  applicable: "Применимая редакция",
+  inapplicable: "Редакция неприменима",
   unknown: "Применимость не подтверждена",
   comparison: "Редакция для сравнения",
+};
+
+const claimVerdicts = {
+  supported: "Подтверждено",
+  rejected: "Отклонено",
+  unclear: "Недостаточно подтверждений",
 };
 
 let turns = [];
@@ -49,10 +57,16 @@ function node(tag, className, content) {
   return result;
 }
 
+class RequestError extends Error {}
+
 async function api(path, options = {}) {
   const response = await fetch(path, options);
-  const result = await response.json();
-  if (!response.ok) throw new Error(result.error || "Не удалось выполнить запрос.");
+  const result = await response.json().catch(() => null);
+  if (!response.ok || !result) {
+    const knownError = response.headers.get("Content-Type")?.startsWith("application/json")
+      && typeof result?.error === "string";
+    throw new RequestError(knownError ? result.error : "Не удалось выполнить запрос. Повторите попытку.");
+  }
   return result;
 }
 
@@ -102,10 +116,12 @@ function dateBadge(label, iso) {
   return badge;
 }
 
-function addEditionDates(details, citation, hasEventDates) {
+function addEditionDates(details, citation, eventRanges) {
   const badges = node("div", "citation-badges");
-  if ((hasEventDates || citation.applicability === "comparison") && Object.hasOwn(editionStatuses, citation.applicability)) {
-    const badge = node("span", "citation-badge", editionStatuses[citation.applicability]);
+  const label = citation.effective_to && eventRanges?.every(([start]) => start >= citation.effective_to)
+    ? "Историческая редакция" : editionStatuses[citation.applicability];
+  if (label && (citation.applicability !== "unknown" || eventRanges?.length || citation.effective_from || citation.effective_to)) {
+    const badge = node("span", "citation-badge", label);
     badge.dataset.applicability = citation.applicability;
     badges.append(badge);
   }
@@ -116,13 +132,14 @@ function addEditionDates(details, citation, hasEventDates) {
   ].filter(Boolean);
   badges.append(...dates);
   if (badges.childElementCount) details.append(badges);
+  if (citation.edition) details.append(node("p", "citation-edition", citation.edition));
 }
 
-function addSources(body, citations, hasEventDates) {
+function addSources(body, citations, status, eventRanges) {
   const anchors = new Map();
   if (!citations.length) return anchors;
   const section = node("section", "evidence");
-  section.append(node("h4", "", "Источники ответа"));
+  section.append(node("h4", "", status === "offline" ? "Найденные фрагменты" : "Источники ответа"));
   const list = node("ul", "evidence-list");
   for (const citation of citations) {
     const item = node("li");
@@ -130,51 +147,112 @@ function addSources(body, citations, hasEventDates) {
     const label = [citation.title, citation.locator].filter(Boolean).join(" · ");
     const summary = node("summary", "", label);
     details.append(summary);
-    addEditionDates(details, citation, hasEventDates);
-    details.append(node("blockquote", "", citation.quote));
-    const openSource = node("button", "open-source", "Открыть в документе");
+    addEditionDates(details, citation, eventRanges);
+    const openSource = node("button", "open-source");
     openSource.type = "button";
-    openSource.addEventListener("click", () => showDocument(citation.document_id, citation));
+    openSource.append(node("span", "source-quote", citation.quote),
+      node("span", "source-open-label", "Открыть в документе"));
+    openSource.setAttribute("aria-label", `Открыть в документе: ${label}`);
+    openSource.addEventListener("click", () => showDocument(citation.document_id, citation, eventRanges));
     details.append(openSource);
     item.append(details);
     list.append(item);
-    if (!anchors.has(citation.id)) anchors.set(citation.id, []);
-    anchors.get(citation.id).push({details, summary});
+    const entry = {details, summary, label};
+    anchors.set(citation.ref, entry);
   }
   section.append(list);
   body.append(section);
   return anchors;
 }
 
+function citationLink(source) {
+  const button = node("button", "citation-ref", source.label);
+  button.type = "button";
+  button.addEventListener("click", () => {
+    source.details.open = true;
+    source.summary.focus({preventScroll: true});
+    source.details.scrollIntoView({block: "nearest"});
+  });
+  return button;
+}
+
+function addDiagnostics(body, diagnostics) {
+  if (!diagnostics) return;
+  const panel = node("details", "diagnostics");
+  const duration = new Intl.NumberFormat("ru", {maximumFractionDigits: 2})
+    .format(diagnostics.elapsed_ms / 1000);
+  panel.append(node("summary", "", "Как проверялся ответ"));
+  panel.append(node("p", "diagnostic-summary",
+    `${duration} с · ${diagnostics.retry_used ? "Был дополнительный поиск" : "Один проход поиска"}`));
+  if (diagnostics.documents.length) {
+    panel.append(node("h4", "", "Рассмотренные документы"));
+    const list = node("ul", "diagnostic-list");
+    for (const source of diagnostics.documents) {
+      const edition = editionStatuses[source.applicability];
+      list.append(node("li", "", edition ? `${source.title} · ${edition}` : source.title));
+    }
+    panel.append(list);
+  }
+  if (diagnostics.claims.length) {
+    panel.append(node("h4", "", "Проверка утверждений"));
+    const list = node("ul", "diagnostic-list");
+    for (const claim of diagnostics.claims) {
+      const item = node("li", "", claim.text);
+      const reason = claim.reason ? ` · ${claim.reason}` : "";
+      item.append(node("small", "diagnostic-verdict", `${claimVerdicts[claim.verdict]}${reason}`));
+      list.append(item);
+    }
+    panel.append(list);
+  }
+  body.append(panel);
+}
+
 function renderAnswer(body, answer) {
   body.replaceChildren();
   if (Object.hasOwn(answerStatuses, answer.status)) {
-    body.append(node("p", "message-status", answerStatuses[answer.status]));
+    const status = node("p", "message-status", answerStatuses[answer.status]);
+    status.dataset.status = answer.status;
+    body.append(status);
   }
-  const text = node("p", "message-text");
-  body.append(text);
-  const dates = (answer.event_ranges || []).map(([start, end]) => {
+  const summary = node("div", "answer-summary");
+  body.append(summary);
+  const eventRanges = answer.event_ranges || [];
+  const dates = eventRanges.map(([start, end]) => {
     const first = displayDate(start);
     const last = displayDate(end);
     return first && last && first !== last ? `${first} – ${last}` : first || last;
   }).filter(Boolean);
   if (dates.length) body.append(node("p", "event-dates", `Запрошенные даты · ${dates.join(" · ")}`));
-  const anchors = addSources(body, answer.citations || [], Boolean(dates.length));
-  for (const part of answer.text.split(/(\[P\d+\])/g)) {
-    const sources = anchors.get(part.slice(1, -1));
-    if (!sources) {
-      text.append(document.createTextNode(part));
-      continue;
+  const anchors = addSources(body, answer.citations || [], answer.status, eventRanges);
+
+  if (answer.claims?.length) {
+    if (answer.intro) summary.append(node("p", "message-text", answer.intro));
+    const claims = node("ul", "answer-claims");
+    for (const claim of answer.claims) {
+      const row = node("li", "answer-claim");
+      row.append(node("p", "message-text", claim.text));
+      const refs = node("div", "claim-sources");
+      for (const id of claim.sources) {
+        if (anchors.has(id)) refs.append(citationLink(anchors.get(id)));
+      }
+      if (refs.childElementCount) row.append(refs);
+      claims.append(row);
     }
-    const button = node("button", "citation-ref", part);
-    button.type = "button";
-    button.setAttribute("aria-label", `Показать источник ${part.slice(1, -1)}`);
-    button.addEventListener("click", () => {
-      for (const source of sources) source.details.open = true;
-      sources[0].summary.focus();
-    });
-    text.append(button);
+    summary.append(claims);
+    if (answer.gap) {
+      const gap = node("section", "answer-notice");
+      gap.append(node("h4", "", "Не подтверждено базой"), node("p", "", answer.gap));
+      summary.append(gap);
+    }
+  } else {
+    summary.append(node("p", "message-text", answer.text));
   }
+  if (answer.conflict) {
+    const conflict = node("section", "answer-notice");
+    conflict.append(node("h4", "", "Конфликт документов"), node("p", "", answer.conflict));
+    summary.append(conflict);
+  }
+  addDiagnostics(body, answer.diagnostics);
 }
 
 function showFailure(user, assistant, question, text) {
@@ -219,9 +297,8 @@ async function submitQuestion(question) {
     turns = turns.slice(-14);
   } catch (error) {
     if (!request.signal.aborted) {
-      showFailure(user, assistant, question, error instanceof TypeError
-        ? "Не удалось связаться с сервером. Проверьте, что прототип запущен."
-        : error.message);
+      const text = error instanceof RequestError ? error.message : "Не удалось получить ответ. Повторите запрос.";
+      showFailure(user, assistant, question, text);
     }
   } finally {
     if (activeRequest === request) {
@@ -300,20 +377,22 @@ function showLibraryIndex() {
   documentSearch.focus({preventScroll: true});
 }
 
-async function showDocument(id, citation) {
+async function showDocument(id, citation, eventRanges) {
   documentRequest?.abort();
   const request = new AbortController();
   documentRequest = request;
   if (!library.open) library.showModal();
   libraryIndex.hidden = true;
   documentView.hidden = false;
-  documentView.scrollTop = 0;
   documentView.setAttribute("aria-busy", "true");
   documentTitle.textContent = citation?.title || "Загружаю документ…";
   documentFilename.textContent = "";
   documentText.textContent = "";
+  documentText.scrollTop = 0;
+  documentEdition.replaceChildren();
   documentLocation.textContent = citation?.locator || "";
   documentLocation.hidden = !citation?.locator;
+  if (citation) addEditionDates(documentEdition, citation, eventRanges);
 
   try {
     const item = await api(`/api/documents/${encodeURIComponent(id)}`, {signal: request.signal});
@@ -321,18 +400,21 @@ async function showDocument(id, citation) {
     documentTitle.textContent = item.title;
     documentFilename.textContent = item.filename;
     documentTitle.focus({preventScroll: true});
-    const position = citation?.quote ? item.text.indexOf(citation.quote) : -1;
-    if (position >= 0) {
-      const mark = node("mark", "", citation.quote);
-      documentText.replaceChildren(item.text.slice(0, position), mark, item.text.slice(position + citation.quote.length));
-      mark.scrollIntoView({block: "center"});
-    } else {
-      documentText.textContent = item.text;
+    let cursor = 0;
+    let firstMark = null;
+    for (const [start, end] of citation?.highlights || []) {
+      if (!(cursor <= start && start < end && end <= item.text.length)) continue;
+      const mark = node("mark", "", item.text.slice(start, end));
+      documentText.append(item.text.slice(cursor, start), mark);
+      firstMark ||= mark;
+      cursor = end;
     }
+    documentText.append(item.text.slice(cursor));
+    firstMark?.scrollIntoView({block: "center"});
   } catch (error) {
     if (!request.signal.aborted) {
       documentTitle.textContent = "Документ недоступен";
-      documentText.textContent = error instanceof TypeError ? "Не удалось связаться с сервером." : error.message;
+      documentText.textContent = error instanceof RequestError ? error.message : "Не удалось загрузить документ.";
       documentTitle.focus({preventScroll: true});
     }
   } finally {

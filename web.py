@@ -28,6 +28,7 @@ LOGGER = logging.getLogger("psb.web")
 APPLICABILITY = {"applicable", "inapplicable", "unknown", "comparison"}
 VERDICTS = {"supported", "rejected", "unclear"}
 SERVICE_ERROR = "Сервис не смог обработать запрос. Повторите попытку."
+CONDITIONAL_LEAD = re.compile(r"^(?:если|при условии(?:, что)?)\s+.{3,150}?(?=,\s|\s+[—–]\s)", re.I)
 
 
 def format_dialog(payload: object) -> tuple[str, list[dict[str, str]]]:
@@ -122,6 +123,12 @@ def public_trace(trace: dict, documents: dict[str, Document]) -> dict:
     }
 
 
+def confirmed_condition(text: str) -> str:
+    """Use only a condition already stated in the verified wording."""
+    match = CONDITIONAL_LEAD.match(" ".join(text.split()))
+    return match[0] if match else ""
+
+
 def answer_payload(answer: Answer, corpus: Corpus, bounds: dict[str, tuple[int, int]], diagnostics: bool) -> dict:
     citations = list(dict.fromkeys(answer.citations))
     refs = {citation: f"source-{index}" for index, citation in enumerate(citations, 1)}
@@ -149,7 +156,8 @@ def answer_payload(answer: Answer, corpus: Corpus, bounds: dict[str, tuple[int, 
         "event_ranges": answer.event_ranges,
         "citations": sources,
         "claims": [
-            {"text": claim.text, "sources": [refs[citation] for citation in claim.citations]}
+            {"text": claim.text, "sources": [refs[citation] for citation in claim.citations],
+             "condition": confirmed_condition(claim.text) if claim.citations else ""}
             for claim in answer.claims
         ],
         "gap": answer.gap,

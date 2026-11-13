@@ -201,8 +201,11 @@ def run(implementation, output):
             assert trace["selected_applicability"] != "inapplicable", trace
             assert trace["chat_calls"] == {"draft": 1, "verify": 1}, trace
             if case.behavior in {"wrong_source", "raw_instead"}:
-                assert answer.status == "insufficient" and not answer.citations, trace
+                assert answer.status == "insufficient" and not getattr(answer, "claims", ()), trace
                 assert "Итого к уплате" not in answer.csv_text(), trace
+                if answer.citations:
+                    assert "потенциально относящиеся" in answer.csv_text(), trace
+                    assert [c.locator for c in answer.citations] == ["п. 7.2"], trace
             elif case.behavior == "days_unit":
                 assert answer.status == "partial" and GAP in answer.csv_text(), trace
                 assert "Итого к уплате" not in answer.csv_text(), trace

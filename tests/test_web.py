@@ -5,9 +5,11 @@ from pathlib import Path
 from threading import Thread
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
-from assistant import Answer, Citation, Claim
+from assistant import Answer, Citation, Claim, LegalAssistant
 from corpus import Document, Passage, load_corpus
+from proxy import Settings
 from web import AssistantServer, passage_bounds, quote_offsets
 
 
@@ -103,6 +105,56 @@ class WebTests(unittest.TestCase):
         self.assertIn("Без истории", second_answer["text"])
         self.assertNotIn("А-08/2024", second_answer["text"])
         self.assertNotIn("diagnostics", first_answer)
+
+    def test_conditional_variants_are_cited_and_keep_the_missing_information(self):
+        older, newer = (
+            next(p for p in self.corpus.passages.values() if p.locator == "п. 2.3" and edition in
+                 self.corpus.documents[p.document_id].title)
+            for edition in ("ред 2023", "ред 2025")
+        )
+        claims = [
+            {"text": "Если применима прежняя редакция, порог составляет свыше 1 млн рублей.",
+             "evidence": [older.id]},
+            {"text": "Если применима действующая редакция, порог составляет свыше 3 млн рублей.",
+             "evidence": [newer.id]},
+            {"text": "Для применения порога важна сумма договора.", "evidence": [newer.id],
+             "condition": "Выдуманное исключение"},
+        ]
+        gap = "Не указана дата заключения договора."
+        assistant = LegalAssistant(self.corpus, Settings(
+            base_url="http://fixture.local", key="fixture-only", model="fixture", retry_search=False,
+        ))
+
+        def handler(question, history):
+            if question == "Какая редакция была в 2020 году?":
+                return Answer("insufficient", gap, [], gap=gap)
+            return assistant.ask_dialogue(question, history)
+
+        request = self.launch(handler)
+        with patch.object(assistant.gateway, "chat", side_effect=[
+            {"status": "partial", "claims": claims, "gap": gap},
+            {"supported": [0, 1, 2], "gap_ok": True},
+        ]) as gateway:
+            status, answer = request("/api/ask", {"messages": [{
+                "role": "user",
+                "content": "Как менялся порог согласования с финансовым директором? Дата договора неизвестна.",
+            }]})
+        self.assertEqual(gateway.call_count, 2)
+        self.assertEqual([item["text"] for item in gateway.call_args.args[1]["claims"]],
+                         [claim["text"] for claim in claims])
+        self.assertEqual(status, 200)
+        self.assertEqual(answer["status"], "partial")
+        self.assertEqual(answer["gap"], gap)
+        self.assertEqual([claim["condition"] for claim in answer["claims"]],
+                         ["Если применима прежняя редакция", "Если применима действующая редакция", ""])
+        for claim, source in zip(answer["claims"][:2], answer["citations"], strict=True):
+            self.assertEqual(claim["sources"], [source["ref"]])
+        status, unanswered = request("/api/ask", {
+            "messages": [{"role": "user", "content": "Какая редакция была в 2020 году?"}]
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(unanswered["gap"], gap)
+        self.assertEqual(unanswered["claims"], [])
 
     def test_service_failure_does_not_return_exception_or_model_details(self):
         def handler(question, history):

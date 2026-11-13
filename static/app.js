@@ -207,6 +207,28 @@ function addDiagnostics(body, diagnostics) {
   body.append(panel);
 }
 
+function claimList(claims, anchors, ordered = false) {
+  const list = node(ordered ? "ol" : "ul", "answer-claims");
+  for (const claim of claims) {
+    const row = node("li", "answer-claim");
+    row.append(node("p", "message-text", claim.text));
+    const refs = node("div", "claim-sources");
+    for (const id of claim.sources) {
+      if (anchors.has(id)) refs.append(citationLink(anchors.get(id)));
+    }
+    if (refs.childElementCount) row.append(refs);
+    list.append(row);
+  }
+  return list;
+}
+
+function addAnswerNotice(summary, title, text) {
+  if (!text) return;
+  const notice = node("section", "answer-notice");
+  notice.append(node("h4", "", title), node("p", "", text));
+  summary.append(notice);
+}
+
 function renderAnswer(body, answer) {
   body.replaceChildren();
   if (Object.hasOwn(answerStatuses, answer.status)) {
@@ -225,33 +247,27 @@ function renderAnswer(body, answer) {
   if (dates.length) body.append(node("p", "event-dates", `Запрошенные даты · ${dates.join(" · ")}`));
   const anchors = addSources(body, answer.citations || [], answer.status, eventRanges);
 
-  if (answer.claims?.length) {
+  const claims = answer.claims || [];
+  if (claims.length) {
     if (answer.intro) summary.append(node("p", "message-text", answer.intro));
-    const claims = node("ul", "answer-claims");
-    for (const claim of answer.claims) {
-      const row = node("li", "answer-claim");
-      row.append(node("p", "message-text", claim.text));
-      const refs = node("div", "claim-sources");
-      for (const id of claim.sources) {
-        if (anchors.has(id)) refs.append(citationLink(anchors.get(id)));
-      }
-      if (refs.childElementCount) row.append(refs);
-      claims.append(row);
-    }
-    summary.append(claims);
-    if (answer.gap) {
-      const gap = node("section", "answer-notice");
-      gap.append(node("h4", "", "Не подтверждено базой"), node("p", "", answer.gap));
-      summary.append(gap);
+    const alternatives = claims.filter(claim => claim.condition);
+    const distinct = new Set(alternatives.map(claim => claim.condition.toLocaleLowerCase("ru")));
+    if (distinct.size >= 2) {
+      const generalClaims = claims.filter(claim => !claim.condition);
+      if (generalClaims.length) summary.append(claimList(generalClaims, anchors));
+      const panel = node("section", "answer-variants");
+      panel.append(node("h4", "", "Варианты по условиям"), claimList(alternatives, anchors, true));
+      summary.append(panel);
+    } else {
+      summary.append(claimList(claims, anchors));
     }
   } else {
-    summary.append(node("p", "message-text", answer.text));
+    const gap = answer.gap?.trim();
+    const text = gap && answer.text.endsWith(gap) ? answer.text.slice(0, -gap.length).trim() : answer.text;
+    if (text) summary.append(node("p", "message-text", text));
   }
-  if (answer.conflict) {
-    const conflict = node("section", "answer-notice");
-    conflict.append(node("h4", "", "Конфликт документов"), node("p", "", answer.conflict));
-    summary.append(conflict);
-  }
+  addAnswerNotice(summary, "Чего не хватает", answer.gap);
+  addAnswerNotice(summary, "Конфликт документов", answer.conflict);
   addDiagnostics(body, answer.diagnostics);
 }
 

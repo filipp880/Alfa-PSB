@@ -2,13 +2,11 @@
 !Dockerfile
 !assistant.py
 !corpus.py
-!fact_checks.py
 !proxy.py
 !solution.py
 !telemetry.py
 !web.py
 !requirements.txt
-!requirements-dev.txt
 !static/
 !static/**
 !data/

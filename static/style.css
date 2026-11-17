@@ -161,14 +161,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
 .retry { margin-top: 12px; border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px; color: var(--accent-dark); background: var(--paper); font-size: 13px; }
 .retry:hover { border-color: var(--accent); }
 .answer-summary { display: grid; gap: 12px; }
-.answer-claims { display: grid; gap: 13px; margin: 0; padding: 0; list-style: none; }
 .answer-claim + .answer-claim { padding-top: 12px; border-top: 1px solid var(--line); }
-.answer-variants > h4 { margin: 0 0 8px; font-size: 13px; }
-.answer-variants ol { padding-inline-start: 22px; list-style: decimal; }
-.answer-variants li::marker { color: var(--muted); font-size: 13px; font-weight: 650; }
 .claim-sources { display: flex; flex-wrap: wrap; gap: 5px 10px; margin-top: 4px; }
-.answer-notice { padding: 8px 10px; border-left: 2px solid #d88165; border-radius: 0 6px 6px 0; background: var(--accent-wash); color: #763214; font-size: 13px; }
-.answer-notice h4, .answer-notice p { margin: 0; }
 
 .evidence { margin-top: 17px; padding-top: 12px; border-top: 1px solid var(--line); }
 .event-dates { margin: 11px 0 0; color: var(--muted); font-size: 12px; }
@@ -188,12 +182,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
 .source-quote { display: block; padding: 0 0 0 11px; border-left: 2px solid #e29a82; color: #374259; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
 .open-source:hover .source-quote { border-color: var(--accent); background: var(--accent-wash); }
 .source-open-label { display: block; margin-top: 5px; font-size: 12px; font-weight: 650; text-decoration: underline; text-underline-offset: 3px; }
-.diagnostics { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; color: var(--muted); font-size: 13px; }
-.diagnostics summary { width: fit-content; color: var(--ink); font-weight: 650; cursor: pointer; }
-.diagnostics h4 { margin: 10px 0 4px; color: var(--ink); }
-.diagnostic-summary { margin: 6px 0 0; }
-.diagnostic-list { display: grid; gap: 5px; margin: 0; padding-left: 19px; }
-.diagnostic-verdict { display: block; color: var(--ink); font-size: 12px; }
 
 .composer-area { padding: 15px 28px max(12px, env(safe-area-inset-bottom)); }
 .composer {

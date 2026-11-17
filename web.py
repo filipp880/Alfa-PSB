@@ -12,8 +12,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from assistant import Answer, LegalAssistant, load_assistant
-from corpus import Corpus, Document
+from assistant import INLINE_REFERENCE, Answer, LegalAssistant, load_assistant
+from corpus import Corpus
+from proxy import Settings
 
 
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
@@ -25,10 +26,7 @@ STATIC_FILES = {
 MAX_REQUEST_BYTES = 128 * 1024
 MAX_DIALOG_CHARACTERS = 24_000
 LOGGER = logging.getLogger("psb.web")
-APPLICABILITY = {"applicable", "inapplicable", "unknown", "comparison"}
-VERDICTS = {"supported", "rejected", "unclear"}
 SERVICE_ERROR = "Сервис не смог обработать запрос. Повторите попытку."
-CONDITIONAL_LEAD = re.compile(r"^(?:если|при условии(?:, что)?)\s+.{3,150}?(?=,\s|\s+[—–]\s)", re.I)
 
 
 def format_dialog(payload: object) -> tuple[str, list[dict[str, str]]]:
@@ -101,44 +99,18 @@ def quote_offsets(text: str, quote: str, bounds: tuple[int, int] | None = None) 
     return [[len(text[:offset].encode("utf-16-le")) // 2 for offset in span] for span in spans]
 
 
-def public_trace(trace: dict, documents: dict[str, Document]) -> dict:
-    """Serialize only diagnostics intended for the chat interface."""
+def answer_payload(answer: Answer, corpus: Corpus, bounds: dict[str, tuple[int, int]]) -> dict:
+    refs: dict[str, list[str]] = {}
     sources = []
-    for entry in trace.get("documents", [])[:24]:
-        document = documents.get(entry.get("document_id"))
-        if document is not None:
-            applicability = entry.get("applicability")
-            sources.append({"title": document.title,
-                            "applicability": applicability if applicability in APPLICABILITY else "unknown"})
-    claims = [
-        {"text": entry["text"][:900], "verdict": entry["verdict"], "reason": entry.get("reason", "")[:160]}
-        for entry in trace.get("claims", [])[:18]
-        if entry.get("verdict") in VERDICTS and isinstance(entry.get("text"), str)
-    ]
-    return {
-        "documents": sources,
-        "claims": claims,
-        "retry_used": trace.get("retry_used") is True,
-        "elapsed_ms": max(0, int(trace.get("elapsed_ms", 0))),
-    }
-
-
-def confirmed_condition(text: str) -> str:
-    """Use only a condition already stated in the verified wording."""
-    match = CONDITIONAL_LEAD.match(" ".join(text.split()))
-    return match[0] if match else ""
-
-
-def answer_payload(answer: Answer, corpus: Corpus, bounds: dict[str, tuple[int, int]], diagnostics: bool) -> dict:
-    citations = list(dict.fromkeys(answer.citations))
-    refs = {citation: f"source-{index}" for index, citation in enumerate(citations, 1)}
-    sources = []
-    for citation in citations:
+    for index, citation in enumerate(dict.fromkeys(answer.citations), 1):
+        ref = f"source-{index}"
+        refs.setdefault(f"[{citation.id}]", []).append(ref)
+        passage = corpus.passages[citation.id]
         document = corpus.documents.get(citation.document_id)
-        highlights = quote_offsets(document.text, citation.quote, bounds.get(citation.id)) if document else []
+        bounds_for_passage = bounds.get(citation.id)
+        highlights = quote_offsets(document.text, citation.quote, bounds_for_passage) if document and bounds_for_passage else []
         sources.append({
-            "id": citation.id,
-            "ref": refs[citation],
+            "ref": ref,
             "document_id": citation.document_id,
             "title": citation.title,
             "locator": citation.locator,
@@ -148,32 +120,29 @@ def answer_payload(answer: Answer, corpus: Corpus, bounds: dict[str, tuple[int, 
             "effective_to": citation.effective_to,
             "snapshot_date": citation.snapshot_date,
             "applicability": citation.applicability,
-            "edition": citation.edition,
+            "edition": passage.edition_note or (document.edition_note if document else ""),
         })
-    result = {
+    # The core appends passage IDs to each approved claim and separates paragraphs with blank lines.
+    paragraphs = []
+    for paragraph in answer.text.split("\n\n"):
+        markers = dict.fromkeys(INLINE_REFERENCE.findall(paragraph))
+        paragraphs.append({
+            "text": INLINE_REFERENCE.sub("", paragraph).strip(),
+            "sources": [ref for marker in markers for ref in refs.get(marker, [])],
+        })
+    return {
         "status": answer.status,
-        "text": SERVICE_ERROR if answer.status == "error" else answer.csv_text(),
+        "text": answer.csv_text(),
         "event_ranges": answer.event_ranges,
         "citations": sources,
-        "claims": [
-            {"text": claim.text, "sources": [refs[citation] for citation in claim.citations],
-             "condition": confirmed_condition(claim.text) if claim.citations else ""}
-            for claim in answer.claims
-        ],
-        "gap": answer.gap,
-        "intro": answer.intro,
-        "conflict": answer.conflict,
+        "paragraphs": paragraphs,
     }
-    if diagnostics and answer.trace is not None:
-        result["diagnostics"] = public_trace(answer.trace, corpus.documents)
-    return result
 
 
 class AssistantServer(ThreadingHTTPServer):
-    def __init__(self, address: tuple[str, int], assistant: LegalAssistant, offline: bool, *, diagnostics: bool = False):
+    def __init__(self, address: tuple[str, int], assistant: LegalAssistant, offline: bool):
         self.assistant = assistant
         self.offline = offline
-        self.diagnostics = diagnostics
         self.passage_bounds = passage_bounds(assistant.corpus)
         super().__init__(address, AssistantHandler)
 
@@ -263,10 +232,8 @@ class AssistantHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            options = {"diagnostics": True} if self.server.diagnostics else {}
-            answer = self.server.assistant.ask_dialogue(question, history, **options)
-            result = answer_payload(answer, self.server.assistant.corpus, self.server.passage_bounds,
-                                    self.server.diagnostics)
+            answer = self.server.assistant.ask_dialogue(question, history)
+            result = answer_payload(answer, self.server.assistant.corpus, self.server.passage_bounds)
         except Exception as exc:
             LOGGER.error("Assistant request failed: %s", type(exc).__name__)
             self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": SERVICE_ERROR})
@@ -293,9 +260,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    assistant = load_assistant(args.kb, offline=args.offline)
-    diagnostics = os.getenv("PSB_WEB_DIAGNOSTICS", "").strip().casefold() in {"1", "true", "yes", "on"}
-    with AssistantServer((args.host, args.port), assistant, args.offline, diagnostics=diagnostics) as server:
+    offline = args.offline or not Settings.from_env().ready
+    assistant = load_assistant(args.kb, offline=offline)
+    with AssistantServer((args.host, args.port), assistant, offline) as server:
         print(f"ПСБ: http://{args.host}:{server.server_port}", flush=True)
         try:
             server.serve_forever()

@@ -1,0 +1,8 @@
+# Match the line endings in submissions/3.zip on every platform.
+/assistant.py text eol=lf
+/corpus.py text eol=lf
+/proxy.py text eol=lf
+/solution.py text eol=lf
+/telemetry.py text eol=lf
+/requirements.txt text eol=lf
+*.pdf binary

@@ -25,7 +25,7 @@ const answerStatuses = {
   insufficient: "Недостаточно данных",
   clarification: "Нужно уточнение",
   out_of_scope: "Вне базы знаний",
-  refusal: "Отказ по основаниям",
+  refusal: "Запрос отклонён",
   error: "Ошибка сервиса",
   offline: "Локальный поиск",
 };
@@ -35,12 +35,6 @@ const editionStatuses = {
   inapplicable: "Редакция неприменима",
   unknown: "Применимость не подтверждена",
   comparison: "Редакция для сравнения",
-};
-
-const claimVerdicts = {
-  supported: "Подтверждено",
-  rejected: "Отклонено",
-  unclear: "Недостаточно подтверждений",
 };
 
 let turns = [];
@@ -118,7 +112,7 @@ function dateBadge(label, iso) {
 
 function addEditionDates(details, citation, eventRanges) {
   const badges = node("div", "citation-badges");
-  const label = citation.effective_to && eventRanges?.every(([start]) => start >= citation.effective_to)
+  const label = citation.effective_to && eventRanges.length && eventRanges.every(([start]) => start >= citation.effective_to)
     ? "Историческая редакция" : editionStatuses[citation.applicability];
   if (label && (citation.applicability !== "unknown" || eventRanges?.length || citation.effective_from || citation.effective_to)) {
     const badge = node("span", "citation-badge", label);
@@ -176,57 +170,17 @@ function citationLink(source) {
   return button;
 }
 
-function addDiagnostics(body, diagnostics) {
-  if (!diagnostics) return;
-  const panel = node("details", "diagnostics");
-  const duration = new Intl.NumberFormat("ru", {maximumFractionDigits: 2})
-    .format(diagnostics.elapsed_ms / 1000);
-  panel.append(node("summary", "", "Как проверялся ответ"));
-  panel.append(node("p", "diagnostic-summary",
-    `${duration} с · ${diagnostics.retry_used ? "Был дополнительный поиск" : "Один проход поиска"}`));
-  if (diagnostics.documents.length) {
-    panel.append(node("h4", "", "Рассмотренные документы"));
-    const list = node("ul", "diagnostic-list");
-    for (const source of diagnostics.documents) {
-      const edition = editionStatuses[source.applicability];
-      list.append(node("li", "", edition ? `${source.title} · ${edition}` : source.title));
-    }
-    panel.append(list);
-  }
-  if (diagnostics.claims.length) {
-    panel.append(node("h4", "", "Проверка утверждений"));
-    const list = node("ul", "diagnostic-list");
-    for (const claim of diagnostics.claims) {
-      const item = node("li", "", claim.text);
-      const reason = claim.reason ? ` · ${claim.reason}` : "";
-      item.append(node("small", "diagnostic-verdict", `${claimVerdicts[claim.verdict]}${reason}`));
-      list.append(item);
-    }
-    panel.append(list);
-  }
-  body.append(panel);
-}
-
-function claimList(claims, anchors, ordered = false) {
-  const list = node(ordered ? "ol" : "ul", "answer-claims");
-  for (const claim of claims) {
-    const row = node("li", "answer-claim");
-    row.append(node("p", "message-text", claim.text));
+function renderParagraphs(summary, paragraphs, anchors) {
+  for (const paragraph of paragraphs) {
+    const row = node("div", "answer-claim");
+    row.append(node("p", "message-text", paragraph.text));
     const refs = node("div", "claim-sources");
-    for (const id of claim.sources) {
+    for (const id of paragraph.sources) {
       if (anchors.has(id)) refs.append(citationLink(anchors.get(id)));
     }
     if (refs.childElementCount) row.append(refs);
-    list.append(row);
+    summary.append(row);
   }
-  return list;
-}
-
-function addAnswerNotice(summary, title, text) {
-  if (!text) return;
-  const notice = node("section", "answer-notice");
-  notice.append(node("h4", "", title), node("p", "", text));
-  summary.append(notice);
 }
 
 function renderAnswer(body, answer) {
@@ -247,28 +201,7 @@ function renderAnswer(body, answer) {
   if (dates.length) body.append(node("p", "event-dates", `Запрошенные даты · ${dates.join(" · ")}`));
   const anchors = addSources(body, answer.citations || [], answer.status, eventRanges);
 
-  const claims = answer.claims || [];
-  if (claims.length) {
-    if (answer.intro) summary.append(node("p", "message-text", answer.intro));
-    const alternatives = claims.filter(claim => claim.condition);
-    const distinct = new Set(alternatives.map(claim => claim.condition.toLocaleLowerCase("ru")));
-    if (distinct.size >= 2) {
-      const generalClaims = claims.filter(claim => !claim.condition);
-      if (generalClaims.length) summary.append(claimList(generalClaims, anchors));
-      const panel = node("section", "answer-variants");
-      panel.append(node("h4", "", "Варианты по условиям"), claimList(alternatives, anchors, true));
-      summary.append(panel);
-    } else {
-      summary.append(claimList(claims, anchors));
-    }
-  } else {
-    const gap = answer.gap?.trim();
-    const text = gap && answer.text.endsWith(gap) ? answer.text.slice(0, -gap.length).trim() : answer.text;
-    if (text) summary.append(node("p", "message-text", text));
-  }
-  addAnswerNotice(summary, "Чего не хватает", answer.gap);
-  addAnswerNotice(summary, "Конфликт документов", answer.conflict);
-  addDiagnostics(body, answer.diagnostics);
+  renderParagraphs(summary, answer.paragraphs || [{text: answer.text, sources: []}], anchors);
 }
 
 function showFailure(user, assistant, question, text) {
